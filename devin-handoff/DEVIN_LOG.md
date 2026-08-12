@@ -4398,3 +4398,348 @@ so this entire class of symptom should not reproduce there.
 **Important operational note for future sessions**: the repo now lives at
 `C:\dev\DeepTutor`, not the old OneDrive path. Update any saved paths,
 shortcuts, or muscle-memory `cd` commands accordingly.
+
+---
+
+## 2026-08-06 — Claude — `/docs` page redesign (structure + content depth)
+
+**Item**: not in TODO.md — repo owner request ("I'm not impressed by the look
+and feel... the language is good... font doesn't look appealing").
+**Status**: done.
+**What changed**: `web/app/(utility)/docs/page.tsx` rewritten (hero header,
+client-side search across topic title/summary/body, an icon-based category
+card grid replacing the old pill-nav, redesigned topic cards using the
+`MarkdownRenderer`'s more generous `variant="default"` spacing instead of
+`"compact"`). `web/lib/docs-content.ts` gained `description`/`icon` per
+category and every topic's `body` was substantially rewritten — a second
+pass, prompted by the repo owner pointing out specific under-explained
+topics (e.g. "Knowledge Center" said "reindex" with no definition), expanded
+every topic to define jargon inline (reindex, weighted grade, LLM, persona,
+knowledge base) without becoming a technical manual. A third pass added a
+new "composer toolbar" topic documenting the Home chat composer's mode
+buttons/persona selector/knowledge-base selector/model selector — including
+a real finding from reading the actual code (not guessed): the persona
+selector only affects Chat/Solve/Mastery Path; it is silently inert during
+Quiz/Research/Visualize, since those three run on separate pipelines that
+never read `persona_context`. Sidebar-map table entries and inline body
+references to other topics/sidebar destinations were converted to real
+markdown links (`[Browse Courses](/courses)` etc.) — `MarkdownRenderer`'s
+default variant already styles these as clickable, hover-responsive links
+with no extra work needed.
+**Verified**: rebuilt and tested live in-browser at each stage — search
+filtering (both a real match and a "no results" state), category grid
+navigation, expanding topic cards, and confirmed the new composer-topic's
+persona/mode table renders correctly. Confirmed links render styled and
+clickable (not plain text) via a live screenshot.
+**New findings**: n/a beyond the persona/pipeline finding above (which is
+now documented for end users on the page itself, not just here).
+**Left for later / handing back**: nothing outstanding for this task.
+
+---
+
+## 2026-08-06 — Claude — Identity store migrated from JSON file to Postgres (closes #53)
+
+**Item**: #53 (previously only rescoped/partially fixed on 2026-08-05 — see
+that entry's "O(1) id-indexed lookups instead of O(N) scans," which was
+explicitly a stopgap pending this full migration).
+**Status**: done — the real fix, not another rescoping.
+**What changed**: added a `User` table to `deeptutor/services/db/models.py`
+(Alembic migration `a7e45a49a884_add_users_table.py`) mirroring the old
+JSON record shape field-for-field. Rewrote `deeptutor/multi_user/identity.py`
+top to bottom: every public function (`load_users`, `save_user`, `get_user`,
+`get_user_by_id`, `get_users_by_ids`, `list_user_info`,
+`search_enrollable_users`, `delete_user`, `update_profile_details`,
+`set_disabled`, `set_avatar`, `set_role`) is now `async def` and talks to
+Postgres via the existing `session_scope()` pattern instead of reading/
+rewriting `users.json` on every call. `search_enrollable_users` is now a
+real indexed `ILIKE` query instead of loading every user into Python and
+scanning. Avatar image files and the JWT signing secret stay on disk
+(never part of the scalability problem). Because this made ~12 functions
+async, the change cascaded through every call site: `deeptutor/services/
+auth.py`, `deeptutor/api/routers/auth.py`, and every identity-touching
+function in `deeptutor/multi_user/router.py`, `assignments_router.py`,
+`gradebook.py`, `grants.py`, and `course_units.py` — traced call-site by
+call-site (not just by type-checking) since this touches login and course
+access control. Added `scripts/migrate_users_to_postgres.py`, a one-time,
+idempotent script to copy existing `users.json` accounts into Postgres
+(matched by username; never overwrites an existing row).
+**Verified**: ran the Alembic migration + data-migration script live,
+confirmed all 3 existing test accounts (admin/instructor/student) migrated
+correctly. Signed out and logged back in fresh (exercises `authenticate()`
++ `create_token()`, not just cookie validation). Confirmed Admin → User
+Management, course roster, and the "search a student to enroll" box all
+correctly read from Postgres. `users.json` is left on disk unused as a
+fallback copy, not deleted.
+**New findings**: n/a.
+**Left for later / handing back**: `users.json` can be archived/deleted once
+confidence is high (deliberately left in place for now as a safety net).
+
+---
+
+## 2026-08-06 (cont) — Claude — Admin Insights page added; "User" role relabeled "Student"
+
+**Item**: not in TODO.md — repo owner request, following a colleague's
+suggestion for org-wide analytics on the student dashboard.
+**Status**: done — v1 scope, explicitly agreed with repo owner ("surface
+numbers only, no automated judgment calls"; admin-only for now, not
+instructor-facing yet).
+**What changed**: new `GET /api/v1/multi-user/admin/insights` endpoint
+(`deeptutor/multi_user/router.py`) aggregating gender breakdown, course-type
+(masters/PhD) breakdown, and per-course enrolled/completed/completion-rate,
+optionally scoped to one `CourseUnit.term`. New `/admin/insights` page
+(admin-only, added to the sidebar) rendering stat tiles, two-category
+proportion bars using the shared dataviz palette's pre-validated categorical
+color pair, and a sorted per-course completion list. Separately, renamed the
+"user" role's *displayed* label from "User" to "Student" in the admin
+User Management table/dropdown and the account's own profile page — the
+underlying role value in the database is still `"user"`, unchanged; this
+was cosmetic only, per explicit repo-owner request to avoid confusion with
+generic-user terminology.
+**Verified**: live in-browser — stat tiles, both breakdown panels, and the
+per-course list all render correctly against real seeded data (see next
+entry); confirmed empty/zero states render sanely before seed data existed.
+**New findings**: none at the time; a real gap was identified and later
+closed on 2026-08-12 (see that entry) — completion/dropout numbers were
+not fully trustworthy at this point because unenrolling a student hard-
+deleted their `Enrollment` row outright, discussed in the next-but-one
+entry below.
+**Left for later / handing back**: instructor-scoped view of Insights
+(explicitly deferred — repo owner: "let's see how that goes" before adding
+complexity); historical/multi-year export was flagged as a gap and closed
+same-session (see "Insights CSV export" entry below).
+
+---
+
+## 2026-08-06 (cont 2) — Claude — Ugandan test-data seed script
+
+**Item**: not in TODO.md — repo owner request, to populate realistic data
+for reviewing the new Insights page and dashboards.
+**Status**: done.
+**What changed**: added `scripts/seed_uganda_test_data.py` — seeds 2
+instructors and 20 students with real Ugandan names via the live HTTP API
+only (no direct DB writes): mixed gender (10/10), mixed masters/PhD
+(10/10), 4 course units across 2 terms (one "several quizzes + one final"
+instructor style, one "single quiz + final" style, per repo-owner request
+to exercise both patterns), and submissions with deliberately varied
+correctness so some students pass, some fail, and one is left incomplete
+(skips the final exam on purpose). All assignment questions are
+multiple-choice (`question_type: "choice"`), which the backend grades by
+exact string match with zero LLM calls — deliberately avoids the chat/LLM
+surface per explicit repo-owner instruction ("don't play with the chat
+interface, that needs an LLM").
+**Verified**: ran it against the live stack; confirmed via the Insights
+page and Student Dashboard that gender/course-type breakdowns and
+per-course completion rates all showed real, non-trivial variance (75-100%
+completion range across 5 courses) instead of flat 100%/"Unspecified"
+everywhere.
+**New findings**: flagged to the repo owner (not a bug, a seed-data
+artifact) — the way students were split into cohorts happened to put all
+10 male students in one term and most female students in the other, so
+filtering Insights by a single term shows a skewed gender split. Cosmetic,
+not a platform bug; left as-is since the repo owner didn't ask for a
+rebalance.
+**Left for later / handing back**: script is reusable for resetting a
+fresh dev/staging database with realistic data in the future.
+
+---
+
+## 2026-08-06 (cont 3) — Claude — Self-applying Postgres migrations on container startup
+
+**Item**: not in TODO.md — repo owner caught this before it caused a real
+outage: "before we continue... migrations do not run automatically on
+deploy."
+**Status**: done.
+**What changed**: `Dockerfile`'s entrypoint now runs `python scripts/
+init_db.py` (alembic upgrade head) and `python scripts/
+migrate_users_to_postgres.py` on every container start, retried up to 5
+times (3s apart) in case Postgres isn't accepting connections yet on a
+fresh deploy. Both steps are idempotent, so running them on every boot is
+safe. If migrations fail after retries, the container now refuses to start
+(`exit 1`) rather than serving an app whose code expects a schema that was
+never created.
+**Verified**: rebuilt, recreated the container, confirmed the migration
+step runs and no-ops cleanly against an already-migrated database, and
+that login still works afterward. Re-confirmed on every subsequent
+container rebuild this session (multiple times) that the step runs
+correctly and picks up new migrations automatically (e.g. the
+`withdrawn_at` column and the FK-hardening migration below both applied
+via this path with zero manual intervention).
+**New findings**: separately clarified with the repo owner that DeepTutor
+is **not deployed anywhere remote yet** — everything runs on the local
+Docker stack at `C:\dev\DeepTutor`. A Railway project on the repo owner's
+account (`sanyu-chatbot`) is a different, unrelated app — do not target it
+for DeepTutor work. Saved to Claude's persistent memory to avoid
+re-investigating this in future sessions.
+**Left for later / handing back**: none — this closes the class of risk
+outright rather than deferring it.
+
+---
+
+## 2026-08-06 (cont 4) — Claude — Enrollment soft-delete (track withdrawal, don't delete) + Insights CSV export
+
+**Item**: not in TODO.md — two repo-owner requests handled together:
+"we should mark it and not just remove them completely... track the date,"
+plus "add a button for [CSV export], only for the admin."
+**Status**: done.
+**What changed**: `Enrollment` gained a `withdrawn_at` column
+(`5726a98947e7_add_enrollment_withdrawn_at.py`). `unenroll_student()` and
+`approve_leave()` in `course_units.py` now move a previously-`approved`/
+`leave_requested` enrollment to `status="withdrawn"` + stamp `withdrawn_at`
+instead of hard-deleting the row; a merely-`pending` request being rejected
+still hard-deletes (nothing happened yet, nothing worth keeping).
+`enroll_student()`/`request_enrollment()` correctly revive a withdrawn row
+back to active status on re-enrollment (clearing `withdrawn_at`), and
+`request_enrollment` still correctly refuses to revive onto an archived
+course unit (same rule a brand-new join already follows). The admin
+Insights endpoint now reports real withdrawal counts (org-wide and per-
+course) instead of the "dropout tracking isn't available" disclaimer it
+shipped with two entries ago. Added `GET .../admin/insights/export`
+(admin-only CSV) plus a matching "Export CSV" button on the Insights page.
+**Verified**: live — unenrolled a student from a course roster, confirmed
+they dropped off the active roster view but the Insights page immediately
+showed "1 withdrawn," the affected course's completion line updated to
+match (e.g. "8/9 completed · 1 withdrawn · 88.9%"), and the CSV export's
+numbers matched the on-screen numbers exactly (fetched and diffed both).
+**New findings**: n/a.
+**Left for later / handing back**: none for this specific task; the
+underlying `Enrollment.user_id`/`Submission.user_id` referential-integrity
+question this surfaced was picked up properly on 2026-08-12 (see below).
+
+---
+
+## 2026-08-12 — Claude — Pre-`main`-PR code review of `staging`: 3 real bugs fixed, 13 more filed as issues
+
+**Item**: not in TODO.md — repo owner explicitly asked for a `/code-review`
+pass on `staging` (not `development`) ahead of an eventual PR to `main`,
+since `main` is a very old baseline and `staging` is ~97 commits of
+accumulated work across many sessions.
+**Status**: done — reviewed in full; 3 of the most severe findings fixed
+same-session, the remaining 13 filed as GitHub issues (label `code-review`)
+for the repo owner to work through incrementally, per their explicit
+choice given limited session budget.
+**What changed** (the 3 fixes, all in `development` then promoted to
+`staging`):
+1. `list_course_units()`/`list_course_units_for_instructor()` gained a
+   paginated default (`limit=50`) in earlier work, but three read sites
+   (student-facing course catalog, instructor student-overview dashboard,
+   `build_instructor_report`) still called them expecting "return
+   everything" — silently truncating past 50 course units with no error.
+   Both functions now treat `limit=0` as unbounded; the three call sites
+   pass it explicitly.
+2. The course roster endpoint applied LIMIT/OFFSET across every enrollment
+   status with no `ORDER BY`, then filtered the already-cut page down to
+   `"approved"` in Python — while the reported total came from a
+   separately status-filtered count, so the displayed total and the actual
+   row count could disagree. `list_enrollments_for_course()` now takes an
+   optional `status` filter applied at the DB level *before* pagination,
+   plus a deterministic `ORDER BY created_at`.
+3. Unenrolling a student from a course chip on the Student Dashboard
+   resolved the target course by matching its *name*, not its id — two
+   course units sharing a name (the same course offered across terms)
+   could silently target the wrong one. The overview endpoints now return
+   each enrollment's `course_unit_id` paired with its name (`courses:
+   [{id, name}]`, alongside the old `course_names` kept for back-compat);
+   the frontend uses that directly.
+**Verified**: each fix tested live in-browser after rebuild — roster total
+now exactly matches the row count returned (confirmed via network
+response); unenrolling a student from one of two same-named-pattern
+courses removed only the intended course (confirmed via the confirm
+dialog text naming the correct course, and the resulting row afterward).
+Re-read the full diff of the 3 fixes before committing, checking every
+other caller of the three changed functions for regressions — found none.
+**New findings — the 13 filed as issues** (all under the `code-review`
+label, `atwine/DeepTutor-ACE-Uganda` repo): #62 silent KB-grant-sync
+failure can leave a withdrawn student with lingering RAG access to course
+materials (highest severity of the unfixed batch); #63 resetting a
+student's submission attempts doesn't clear their now-stale course
+completion; #64 a course made entirely of optional assignments can never
+mark a student complete (an off-by-logic in the early-return, not the
+loop); #65 explicit `points: 0` on a question is silently coerced to 1
+(Python `0 or 1.0` truthiness bug) in both storage and grading; #66
+`delete_user_data` leaves orphaned `AssignmentAccessGrant`/
+`NotificationRead` rows (a real gap this was later resolved-around, not
+fixed, by the FK-hardening entry below — see that entry); #67 marking a
+notification read has no enrollment check (any authenticated user can
+mark any notification-id read); #68-#70 three frontend bugs (bulk admin
+actions fail silently on partial failure; the admin feedback list caps at
+200 rows with no pagination; sign-out swallows errors with no user
+feedback); #71 Student Dashboard has no server-side pagination unlike
+every comparable admin list; #72 two minor admin UX papercuts bundled
+together; #73-#76 four instances of the same root-cause pattern —
+UI-local state mutations (enroll/approve/unenroll on the roster editor,
+refresh/save on the course-units page, delete on the users page) that
+don't stay in sync with server-side pagination totals/offsets, so the
+page number and the actual displayed rows can disagree after an action;
+#74 a notebook-preview race condition (no request-id guard against
+overlapping fetches — a slower stale response can overwrite a faster
+newer one); #77 no explicit DB connection timeout configured, so the
+startup migration retry loop's worst-case time could be much longer than
+its own comment implies under a specific network-failure mode (flagged
+PLAUSIBLE, not confirmed).
+**Left for later / handing back**: issues #62-#67, #68-#72 (frontend), and
+#73-#77 are all open and unfixed as of this entry — pick them up
+incrementally. #66 specifically is worth re-checking against the FK-
+hardening entry below before starting work on it, since that entry
+resolves it structurally (CASCADE now auto-cleans those two tables) even
+though the issue itself wasn't explicitly closed.
+
+---
+
+## 2026-08-12 (cont) — Claude — Real foreign-key constraints enforced on every `user_id` column
+
+**Item**: not in TODO.md — repo owner raised a serious, specific worry
+after the code-review pass: a semester's worth of student data silently
+becoming disassociated/unrecoverable due to a broken reference, with real
+academic consequences if it happened near the end of a semester.
+**Status**: done — this is one of two concrete follow-ups recommended in
+response (the other, real backups, is NOT done — filed as issue #78, see
+below; do not assume this entry means the platform is safe from data
+*loss*, only from *silent logical drift*).
+**What changed**: every table that references a student/instructor
+account — `course_unit_instructors.instructor_id`, `enrollments.user_id`,
+`submissions.user_id`, `assignment_access_grants.user_id`/`granted_by`,
+`notification_reads.user_id` — stored that link as a bare string with no
+real database-enforced connection to `users`, a decision made back when
+accounts still lived in a separate JSON file (a FK can't point at a file).
+Accounts moved into Postgres on 2026-08-06 (see above) but these links
+were never tightened to match — closed now via a new Alembic migration
+(`1ed75137f032_enforce_user_foreign_keys.py`) adding real FKs, each with a
+deliberately chosen `ON DELETE` policy documented inline in
+`models.py`: CASCADE for course-instructor links, enrollments, access
+grants (user_id), and notification read-receipts (the referencing row is
+meaningless without the account); SET NULL for `assignment_access_grants.
+granted_by` (an audit-trail field — deleting the granter shouldn't take
+down a *different* student's still-valid grant); and, deliberately NOT
+CASCADE, **RESTRICT for `submissions.user_id`** — a Submission is a
+student's actual grade record, and the database now refuses to delete an
+account while graded submissions still reference it, full stop, unless
+they're explicitly swept first by the one reviewed code path. This
+required reordering `identity.delete_user()` to sweep `Enrollment`/
+`Submission` rows *before* deleting the `User` row instead of after (the
+old order would make every account deletion fail under the new
+constraint, since RESTRICT would fire while submissions were still
+attached).
+**Verified**: live, both directions. Attempted a raw `DELETE FROM users`
+via `psql` directly against an account with 6 real graded submissions —
+**Postgres refused it outright**, citing the exact FK constraint by name.
+Then deleted the same account the normal way, through the actual admin
+panel UI — succeeded end-to-end, and a follow-up query confirmed zero
+orphaned rows left in `submissions`, `enrollments`, or the `users` table
+itself. Re-ran the full 5-table orphan-scan query used before the FK
+constraints existed and confirmed zero orphans anywhere after the test.
+Confirmed the rest of the app (Insights, Student Dashboard, course roster)
+correctly reflected the deletion everywhere with no other breakage.
+**New findings**: this structurally resolves issue #66 (orphaned
+`AssignmentAccessGrant`/`NotificationRead` rows on user delete) as a side
+effect — CASCADE now makes that class of orphan impossible going forward
+— but issue #66 itself was not explicitly closed; worth closing explicitly
+in a future session with a note pointing at this entry, rather than
+leaving it open and confusing.
+**Left for later / handing back**: filed as two follow-up issues, both
+under `code-review`: **#78 — no backups exist at all**, explicitly called
+out as the more urgent of the two (referential integrity protects against
+*logical* corruption, not a disk failure or an accidental `docker volume
+rm` destroying the one and only copy of the data outright); **#79 — a
+standing data-integrity health-check script** as a second line of defense
+for anything FK constraints can't catch (logical-but-not-referential
+inconsistencies, e.g. issues #63/#64 above). Neither is started.
