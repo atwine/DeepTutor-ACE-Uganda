@@ -634,25 +634,24 @@ export function StudentDashboard({
                           : "—"}
                       </td>
                       <td className="px-5 py-3">
-                        {student.course_names.length === 0 ? (
+                        {student.courses.length === 0 ? (
                           <span className="text-[var(--muted-foreground)]/60">{t("None")}</span>
                         ) : (
                           <div className="flex flex-wrap gap-1">
-                            {student.course_names.map((name) => {
-                              const courseUnit = allCourses.find((c) => c.name === name);
+                            {student.courses.map(({ id: courseUnitId, name }) => {
                               return (
                                 <span
-                                  key={name}
+                                  key={courseUnitId}
                                   className="inline-flex items-center gap-1 rounded-full bg-[var(--muted)]/40 px-2 py-0.5 text-xs text-[var(--foreground)]"
                                 >
                                   {name}
-                                  {enableActions && courseUnit && (
+                                  {enableActions && (
                                     <button
                                       onClick={() =>
                                         setConfirm({
                                           kind: "unenroll",
                                           student,
-                                          courseUnitId: courseUnit.id,
+                                          courseUnitId,
                                           courseName: name,
                                         })
                                       }

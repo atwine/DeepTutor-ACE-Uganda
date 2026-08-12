@@ -167,7 +167,7 @@ async def build_instructor_report(instructor_id: str, term: str | None = None) -
     with ``asyncio.gather()`` and a concurrency limit of 10, instead
     of sequentially awaiting each ``build_gradebook()`` call in a loop.
     """
-    units = await list_course_units_for_instructor(instructor_id)
+    units = await list_course_units_for_instructor(instructor_id, limit=0)
     if term:
         units = [u for u in units if u.get("term", "") == term]
 
