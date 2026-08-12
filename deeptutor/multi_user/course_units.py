@@ -941,25 +941,20 @@ async def check_and_mark_completion_batch(
 
 
 async def delete_user_data(user_id: str) -> None:
-    """Sweep all Postgres rows referencing ``user_id`` — enrollments and
-    submissions — when a user is deleted from the JSON identity store.
+    """Explicitly delete a user's Enrollment and Submission rows, as a
+    deliberate step of deleting their account.
 
-    The ``Enrollment`` and ``Submission`` tables have no FK to a users table
-    on purpose (identity stays in JSON, out of scope for the DB migration —
-    see ``models.py``'s ``CourseUnitInstructor`` docstring for the rationale).
-    Without this sweep, deleting a user leaves those rows pointing at a
-    now-nonexistent ``user_id`` forever — orphaned roster entries and
-    submission references that break gradebook/roster rendering.
+    ``Enrollment.user_id`` has an ON DELETE CASCADE foreign key, so it
+    would clean up on its own — but ``Submission.user_id`` is deliberately
+    RESTRICT, not CASCADE (grade history should never vanish as a silent
+    side effect of an account deletion — see that column's comment in
+    models.py). That means submissions MUST be deleted explicitly, by a
+    caller making that decision on purpose, before the account itself can
+    be deleted at all; the database will refuse the account deletion
+    otherwise. This function is that explicit, deliberate step.
 
-    Submission rows are deleted (not kept) because a deleted user's
-    submissions are meaningless for grading — the student is gone, the
-    gradebook can't render their name, and leaving them pollutes the
-    instructor's submission list. This matches the existing
-    ``delete_course_unit`` cascade behavior for submissions.
-
-    Called from ``identity.py:delete_user()`` after the JSON record is
-    removed. Does NOT add a FK/cascade at the DB level — this stays an
-    application-level sweep to match how the rest of this subsystem works.
+    Called from ``identity.py:delete_user()`` — and MUST run before that
+    function deletes the ``User`` row, not after (see its docstring).
     """
     async with session_scope() as session:
         await session.execute(

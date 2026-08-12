@@ -264,11 +264,16 @@ async def get_users_by_ids(user_ids: list[str]) -> dict[str, tuple[str, dict[str
 async def delete_user(username: str) -> bool:
     """Delete a user AND sweep their other Postgres rows.
 
-    ``course_units.delete_user_data()`` removes orphaned ``Enrollment``/
-    ``Submission`` rows — those tables have no FK to ``users`` on purpose
-    (added well before accounts moved into Postgres), so without this sweep
-    a deleted user's roster entries and submissions would linger forever,
-    breaking gradebook/roster rendering. See B5 in FEATURE_ROUND2_PLAN.md.
+    ``course_units.delete_user_data()`` explicitly deletes a user's
+    ``Enrollment``/``Submission`` rows. This MUST run before the ``User``
+    row itself is deleted, not after: ``Submission.user_id`` carries a
+    real ``ON DELETE RESTRICT`` foreign key (grade history is deliberately
+    not allowed to cascade-delete — see that column's comment in
+    ``models.py``), so deleting the account first would fail outright with
+    submissions still attached. Sweeping first, then deleting the account,
+    means this intended path always succeeds while any *other*, unreviewed
+    path that tries to delete a user out from under existing submissions
+    gets stopped by the database instead of silently destroying grades.
     """
     from deeptutor.services.db.engine import session_scope
     from deeptutor.services.db.models import User
@@ -280,11 +285,13 @@ async def delete_user(username: str) -> bool:
         if row is None:
             return False
         user_id = row.id
-        await session.execute(delete(User).where(User.username == username))
 
     from .course_units import delete_user_data
 
     await delete_user_data(user_id)
+
+    async with session_scope() as session:
+        await session.execute(delete(User).where(User.username == username))
     return True
 
 

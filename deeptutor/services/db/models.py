@@ -139,19 +139,25 @@ class CourseUnit(Base):
 
 class CourseUnitInstructor(Base):
     """Many-to-many: was a plain JSON list column (`instructor_ids`) on the
-    course-unit record. `instructor_id` has no FK to a users table on
-    purpose — `identity.py` (accounts) is explicitly out of scope for this
-    migration (see the plan's scope section), so a deleted user's id can
-    linger here exactly as it can in today's JSON `instructor_ids` list —
-    a pre-existing gap, not one this migration introduces or is expected to
-    close."""
+    course-unit record.
+
+    `instructor_id` originally had no FK to `users` on purpose — accounts
+    were still a separate JSON file at the time, and a database FK can't
+    point at a file. Issue #53 moved accounts into this same database, so
+    that reason no longer applies; a real FK now enforces that this can
+    never point at an account that doesn't exist. ON DELETE CASCADE: if an
+    instructor's account is deleted, they're removed from any course they
+    were assigned to rather than leaving a dangling, invisible reference
+    (which is what happened before this FK existed)."""
 
     __tablename__ = "course_unit_instructors"
 
     course_unit_id: Mapped[str] = mapped_column(
         ForeignKey("course_units.id", ondelete="CASCADE"), primary_key=True
     )
-    instructor_id: Mapped[str] = mapped_column(String, primary_key=True)
+    instructor_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
 
     course_unit: Mapped[CourseUnit] = relationship(back_populates="instructors")
 
@@ -170,7 +176,13 @@ class Enrollment(Base):
     course_unit_id: Mapped[str] = mapped_column(
         ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # ON DELETE CASCADE matches identity.delete_user's existing explicit
+    # sweep (it already deletes a user's Enrollment rows) — the FK just
+    # makes that guarantee real at the database level instead of relying on
+    # every deletion code path remembering to do it by hand.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     # 'pending' | 'approved' — matches Enrollment.status in course_units.py today.
     status: Mapped[str] = mapped_column(String, nullable=False, default="approved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
@@ -269,7 +281,18 @@ class Submission(Base):
     assignment_id: Mapped[str] = mapped_column(
         ForeignKey("assignments.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # Deliberately RESTRICT, not CASCADE, unlike every other user_id FK in
+    # this file: a Submission is a student's actual grade record, not a
+    # disposable pointer. identity.delete_user() explicitly deletes a
+    # user's submissions itself (a deliberate admin decision, made in the
+    # right order — see that function) before deleting the account, so
+    # RESTRICT never fires on that intended path. What it does stop is any
+    # OTHER code path — a bug, a one-off script, a raw DELETE FROM users —
+    # from silently wiping grade history as a side effect of removing an
+    # account. That has to fail loudly and be a deliberate, separate step.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     # [{question_id: str, answer: str}, ...]
     answers: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
     # [{question_id, question, user_answer, is_correct, score, max_score,
@@ -308,14 +331,23 @@ class AssignmentAccessGrant(Base):
     assignment_id: Mapped[str] = mapped_column(
         ForeignKey("assignments.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    # CASCADE: the grant is meaningless without the student it was made for.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
     # If set, the student gets this many *extra* attempts on top of the
     # assignment's base attempt_limit. NULL means no extra attempts granted.
     extra_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # If set, this student's personal deadline (overrides assignment.due_at).
     # NULL means the assignment's own due_at applies as normal.
     extended_due_at: Mapped[str | None] = mapped_column(String, nullable=True)
-    granted_by: Mapped[str] = mapped_column(String, nullable=False)
+    # Audit trail (who approved this exception), not a functional
+    # dependency — SET NULL rather than CASCADE, so deleting the admin/
+    # instructor who granted it doesn't take a *different* student's still-
+    # valid access grant down with it. Nullable to allow that.
+    granted_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     assignment: Mapped[Assignment] = relationship(back_populates="access_grants")
@@ -378,7 +410,10 @@ class NotificationRead(Base):
     notification_id: Mapped[str] = mapped_column(
         ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # CASCADE: a read-receipt for a deleted account is meaningless.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
