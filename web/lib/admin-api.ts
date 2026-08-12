@@ -161,6 +161,12 @@ export interface StudentOverviewRow {
   avatar: string;
   enrollment_count: number;
   course_names: string[];
+  /** Same enrollments as course_names, paired with the actual course_unit_id
+   * — use this (not name-matching against a separately-fetched course list)
+   * to resolve which course an action like "unenroll" should target, since
+   * two course units can share a display name (e.g. the same course
+   * offered in different terms). */
+  courses: { id: string; name: string }[];
   submission_count: number;
   completion_summary: { completed: number; total: number };
 }

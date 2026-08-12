@@ -472,7 +472,7 @@ async def course_unit_catalog_endpoint(
     # needed beyond not surfacing it as a *new* thing to join).
     catalog = []
     filtered_units = []
-    for unit in await list_course_units():
+    for unit in await list_course_units(limit=0):
         if unit.get("is_archived") and unit["id"] not in status_by_unit:
             continue
         filtered_units.append(unit)
@@ -719,10 +719,9 @@ async def course_unit_roster_endpoint(
     """Approved enrollments only — a pending request belongs on the
     /requests endpoint until an instructor decides on it."""
     await _require_course_unit_access(current, course_unit_id)
-    enrollments = [
-        e for e in await list_enrollments_for_course(course_unit_id, limit=limit, offset=offset)
-        if e.get("status", "approved") == "approved"
-    ]
+    enrollments = await list_enrollments_for_course(
+        course_unit_id, status="approved", limit=limit, offset=offset
+    )
     total = await count_enrollments_for_course(course_unit_id, status="approved")
     # Issue #37: batch user lookup — one file read instead of N.
     user_records = await get_users_by_ids([e["user_id"] for e in enrollments])
@@ -1373,6 +1372,14 @@ async def admin_students_overview(
         uid = s["id"]
         enrollments = enrollments_by_user.get(uid, [])
         course_names = [e["course_name"] for e in enrollments]
+        # Issue: the frontend used to resolve "which course" an unenroll
+        # action targets by matching course_names[i] back to a course by
+        # *name* — wrong when two course units share a name (the same
+        # course offered across terms). Carry the id alongside the name so
+        # the frontend can target the exact enrollment instead of guessing.
+        courses = [
+            {"id": e["course_unit_id"], "name": e["course_name"]} for e in enrollments
+        ]
         completed_count = sum(1 for e in enrollments if e["completed_at"])
 
         # Completion summary: "X/Y courses completed"
@@ -1396,6 +1403,7 @@ async def admin_students_overview(
             "avatar": s.get("avatar") or "",
             "enrollment_count": total_enrolled,
             "course_names": course_names,
+            "courses": courses,
             "submission_count": submission_count_by_user.get(uid, 0),
             "completion_summary": completion_summary,
         })
@@ -1681,7 +1689,7 @@ async def instructor_students_overview(
     instructor_id = current.user_id
 
     # 1. Get the instructor's course units.
-    my_units = await list_course_units_for_instructor(instructor_id)
+    my_units = await list_course_units_for_instructor(instructor_id, limit=0)
     my_course_ids = {u["id"] for u in my_units}
     my_course_names = {u["id"]: u["name"] for u in my_units}
 
@@ -1765,6 +1773,11 @@ async def instructor_students_overview(
     for uid, user_info in users_by_id.items():
         enrollments = enrollments_by_user.get(uid, [])
         course_names = [e["course_name"] for e in enrollments if e["course_name"]]
+        courses = [
+            {"id": e["course_unit_id"], "name": e["course_name"]}
+            for e in enrollments
+            if e["course_name"]
+        ]
         completed_count = sum(1 for e in enrollments if e["completed_at"])
         total_enrolled = len(enrollments)
 
@@ -1782,6 +1795,7 @@ async def instructor_students_overview(
             "avatar": user_info.get("avatar") or "",
             "enrollment_count": total_enrolled,
             "course_names": course_names,
+            "courses": courses,
             "submission_count": submission_count_by_user.get(uid, 0),
             "completion_summary": {
                 "completed": completed_count,

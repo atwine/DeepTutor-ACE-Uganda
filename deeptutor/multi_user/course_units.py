@@ -231,14 +231,18 @@ async def create_course_unit(
 async def list_course_units(
     *, limit: int = 50, offset: int = 0
 ) -> list[dict[str, Any]]:
+    """limit=0 means unbounded — for callers that genuinely need every
+    course unit (the catalog, instructor stats/reports), not a page of
+    them. Every *paginated* caller passes an explicit positive limit."""
     async with session_scope() as session:
-        result = await session.execute(
+        stmt = (
             select(CourseUnit)
             .options(selectinload(CourseUnit.instructors))
             .order_by(CourseUnit.created_at)
-            .limit(limit)
-            .offset(offset)
         )
+        if limit > 0:
+            stmt = stmt.limit(limit).offset(offset)
+        result = await session.execute(stmt)
         units = result.scalars().unique().all()
     return [_unit_to_dict(u) for u in units]
 
@@ -422,16 +426,18 @@ async def is_approved_student_of(user_id: str, course_unit_id: str) -> bool:
 async def list_course_units_for_instructor(
     user_id: str, *, limit: int = 50, offset: int = 0
 ) -> list[dict[str, Any]]:
+    """limit=0 means unbounded — see list_course_units's docstring."""
     async with session_scope() as session:
-        result = await session.execute(
+        stmt = (
             select(CourseUnit)
             .options(selectinload(CourseUnit.instructors))
             .join(CourseUnitInstructor)
             .where(CourseUnitInstructor.instructor_id == str(user_id))
             .order_by(CourseUnit.created_at)
-            .limit(limit)
-            .offset(offset)
         )
+        if limit > 0:
+            stmt = stmt.limit(limit).offset(offset)
+        result = await session.execute(stmt)
         units = result.scalars().unique().all()
     return [_unit_to_dict(u) for u in units]
 
@@ -743,13 +749,27 @@ async def unenroll_student(course_unit_id: str, user_id: str) -> bool:
 
 
 async def list_enrollments_for_course(
-    course_unit_id: str, *, limit: int = 0, offset: int = 0
+    course_unit_id: str, *, status: str = "", limit: int = 0, offset: int = 0
 ) -> list[dict[str, Any]]:
     """Enrollments for a course unit. Issue #41: optional limit/offset
     for pagination — when limit=0 (default), returns all rows (backward
-    compatible with callers that don't paginate)."""
+    compatible with callers that don't paginate).
+
+    ``status`` filters at the DB level *before* limit/offset are applied —
+    a caller that both paginates AND filters by status (the roster
+    endpoint) must pass status here rather than filtering the returned
+    page in Python, or the reported total (from
+    :func:`count_enrollments_for_course`, itself status-filtered) won't
+    match how many of the returned rows actually pass the filter. Also
+    orders by ``created_at`` so paginated results are deterministic —
+    without an ORDER BY, Postgres makes no promise about row order across
+    separate LIMIT/OFFSET calls.
+    """
     async with session_scope() as session:
         stmt = select(Enrollment).where(Enrollment.course_unit_id == course_unit_id)
+        if status:
+            stmt = stmt.where(Enrollment.status == status)
+        stmt = stmt.order_by(Enrollment.created_at)
         if limit > 0:
             stmt = stmt.limit(limit).offset(offset)
         result = await session.execute(stmt)
