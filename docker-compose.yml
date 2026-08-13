@@ -172,8 +172,13 @@ services:
     # its workspace subtree, but the per-user mount is a whole user root, so for
     # non-admin accounts it also carries data/users/<uid>/user/settings,
     # user/chat_history.db, and knowledge_bases — every account's exec can read
-    # every other account's copy of those. That cross-user visibility is
-    # accepted for the invite-only trust posture and enforced no further.
+    # every other account's copy of those. Issue #7: as of the exec-policy
+    # default flip in agentic_pipeline.py's _exec_allowed(), non-admin accounts
+    # no longer get exec at all unless an admin explicitly opts a specific
+    # student back in (grant v2 / exec_override) -- this cross-user filesystem
+    # exposure is now dormant for the accounts that would otherwise trip over
+    # it, not actively mitigated. Revisit this mount before turning exec back
+    # on broadly for students.
     # data/system is never mounted here, which is why credentials that authorize
     # a person (Codex OAuth tokens) live under data/system/user-secrets/<owner>
     # instead of inside a user root — and why installed CLI apps live in a third
