@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from .assignments import (
     check_attempt_limit,
     check_due_at,
     count_submissions,
+    count_submissions_for_assignment,
     create_assignment,
     create_submission_checked,
     delete_assignment,
@@ -41,10 +42,15 @@ from .assignments import (
     update_assignment,
     upsert_access_grant,
 )
-from .course_units import get_course_unit, is_approved_student_of, is_instructor_of
+from .course_units import (
+    check_and_mark_completion,
+    get_course_unit,
+    is_approved_student_of,
+    is_instructor_of,
+)
 from .grading import grade_submission
 from .gradebook import build_gradebook, build_gradebook_csv
-from .identity import get_user_by_id
+from .identity import get_user_by_id, get_users_by_ids
 
 router = APIRouter()
 
@@ -74,6 +80,8 @@ class AssignmentCreate(BaseModel):
     # percentage; None means no pass/fail gating.
     is_major: bool = False
     passing_score: float | None = None
+    # Issue #32: optional/bonus assignments don't block course completion.
+    is_optional: bool = False
 
 
 class AssignmentUpdate(BaseModel):
@@ -87,6 +95,7 @@ class AssignmentUpdate(BaseModel):
     time_limit_minutes: int | None = None
     is_major: bool | None = None
     passing_score: float | None = None
+    is_optional: bool | None = None
 
 
 class AnswerPayload(BaseModel):
@@ -148,6 +157,7 @@ def _assignment_summary(assignment: dict[str, Any]) -> dict[str, Any]:
         "time_limit_minutes": assignment.get("time_limit_minutes"),
         "is_major": assignment.get("is_major", False),
         "passing_score": assignment.get("passing_score"),
+        "is_optional": assignment.get("is_optional", False),
         "question_count": len(assignment.get("questions", [])),
         "created_at": assignment["created_at"],
     }
@@ -176,6 +186,7 @@ async def create_assignment_endpoint(
         time_limit_minutes=payload.time_limit_minutes,
         is_major=payload.is_major,
         passing_score=payload.passing_score,
+        is_optional=payload.is_optional,
     )
     return {"assignment": record}
 
@@ -272,6 +283,7 @@ async def update_assignment_endpoint(
                 if "passing_score" in payload.model_fields_set
                 else _UNSET
             ),
+            is_optional=payload.is_optional,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -388,19 +400,36 @@ async def submit_assignment_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Issue #82: this used to only get re-evaluated as a side effect of the
+    # student later visiting the course catalog (course_unit_catalog_endpoint)
+    # or the gradebook being rebuilt — meaning completion could sit stale
+    # indefinitely right after the exact moment it should have flipped. Cheap
+    # (a handful of indexed queries, no LLM call) — safe to do inline here
+    # rather than deferring to a background task.
+    await check_and_mark_completion(assignment["course_unit_id"], user_id)
+
     return {"submission": record}
 
 
 @router.get("/assignments/{assignment_id}/submissions")
 async def list_submissions_endpoint(
     assignment_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current: TokenPayload = Depends(require_instructor_or_admin),
 ) -> dict[str, Any]:
     assignment = await _get_assignment_or_404(assignment_id)
     await _require_manage_access(current, assignment)
+    records = await list_submissions_for_assignment(assignment_id, limit=limit, offset=offset)
+    total = await count_submissions_for_assignment(assignment_id)
+    # Issue #37: batch user lookup — one file read instead of N (one per
+    # submission). get_users_by_ids loads users.json once and returns a
+    # dict keyed by user_id for O(1) lookups.
+    user_records = await get_users_by_ids([r["user_id"] for r in records])
     submissions = []
-    for record in await list_submissions_for_assignment(assignment_id):
-        user_record = get_user_by_id(record["user_id"])
+    for record in records:
+        user_record = user_records.get(record["user_id"])
         username = user_record[0] if user_record else record["user_id"]
         full_name = str(user_record[1].get("full_name") or "") if user_record else ""
         registration_number = (
@@ -414,7 +443,7 @@ async def list_submissions_endpoint(
                 "registration_number": registration_number,
             }
         )
-    return {"submissions": submissions}
+    return {"submissions": submissions, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/assignments/{assignment_id}/my-submission")
@@ -494,7 +523,7 @@ async def create_access_grant_endpoint(
     extended deadline) for a specific student on this assignment."""
     assignment = await _get_assignment_or_404(assignment_id)
     await _require_manage_access(current, assignment)
-    if get_user_by_id(payload.user_id) is None:
+    if await get_user_by_id(payload.user_id) is None:
         raise HTTPException(status_code=404, detail="Student not found")
     grant = await upsert_access_grant(
         assignment_id,

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { Fragment, useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
@@ -6,7 +6,7 @@ import { useTranslation } from "react-i18next";
 import { fetchAuthStatus } from "@/lib/auth";
 import { listUsers, type UserRecord } from "@/lib/admin-api";
 import {
-  listCourseUnits,
+  listCourseUnitsPaged,
   createCourseUnit,
   updateCourseUnit,
   deleteCourseUnit,
@@ -15,12 +15,14 @@ import {
   type CourseUnit,
 } from "@/lib/course-units-api";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import Pagination from "@/components/common/Pagination";
 import { RosterEditor } from "./RosterEditor";
 import {
   Archive,
   ArchiveRestore,
   BookOpen,
   ClipboardList,
+  Files,
   GraduationCap,
   RefreshCw,
   ArrowLeft,
@@ -77,6 +79,9 @@ export default function CourseUnitsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
+  const [totalCount, setTotalCount] = useState(0);
+  const [pageOffset, setPageOffset] = useState(0);
+  const PAGE_LIMIT = 50;
 
   const [form, setForm] = useState<FormState | null>(null);
   const [formSubmitting, setFormSubmitting] = useState(false);
@@ -87,16 +92,23 @@ export default function CourseUnitsPage() {
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
 
-  const load = useCallback(async (admin: boolean) => {
+  // Issue #72: listUsers() is unbounded (every user) and only exists to
+  // populate the instructor picker in the create/edit form -- it doesn't
+  // need to be refetched on every page-change click, just once up front
+  // and after a save (in case a new instructor account was just created).
+  const load = useCallback(async (admin: boolean, offset: number = 0, includeUsers = true) => {
     setLoading(true);
     setError("");
     try {
-      const [unitList, userList] = await Promise.all([
-        listCourseUnits(),
-        admin ? listUsers() : Promise.resolve<UserRecord[]>([]),
+      const [paged, userList] = await Promise.all([
+        listCourseUnitsPaged(PAGE_LIMIT, offset),
+        admin && includeUsers ? listUsers() : Promise.resolve<UserRecord[] | null>(null),
       ]);
-      setUnits(unitList);
-      setInstructors(userList.filter((u) => u.role === "instructor"));
+      setUnits(paged.items);
+      setTotalCount(paged.total);
+      if (userList !== null) {
+        setInstructors(userList.filter((u) => u.role === "instructor"));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : t("Failed to load course units"));
     } finally {
@@ -197,6 +209,10 @@ export default function CourseUnitsPage() {
         );
       }
       setForm(null);
+      // Issue #75: load(isAdmin) with no offset always reloads page 1 --
+      // reset pageOffset alongside it so the pager control doesn't keep
+      // showing a stale page number for data that's no longer displayed.
+      setPageOffset(0);
       await load(isAdmin);
     } catch (e) {
       setFormError(e instanceof Error ? e.message : t("Failed to save course unit"));
@@ -272,7 +288,7 @@ export default function CourseUnitsPage() {
             {formatDate(unit.created_at, lang)}
           </td>
           <td className="px-5 py-3.5">
-            <div className="flex items-center justify-end gap-1.5">
+            <div className="flex flex-wrap items-center justify-end gap-1.5">
               <button
                 onClick={() =>
                   setExpandedUnitId((current) =>
@@ -308,6 +324,14 @@ export default function CourseUnitsPage() {
                          hover:bg-[var(--background)] hover:text-[var(--foreground)] transition-colors"
               >
                 <BookOpen size={15} />
+              </Link>
+              <Link
+                href={`/admin/course-units/${unit.id}/materials`}
+                title={t("Course Materials")}
+                className="rounded-lg p-1.5 text-[var(--muted-foreground)]
+                         hover:bg-[var(--background)] hover:text-[var(--foreground)] transition-colors"
+              >
+                <Files size={15} />
               </Link>
               <button
                 onClick={() => void handleToggleArchive(unit)}
@@ -363,7 +387,7 @@ export default function CourseUnitsPage() {
 
   return (
     <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
-      <div className="mx-auto max-w-3xl">
+      <div className="mx-auto max-w-5xl">
         <div className="mb-8">
           <div className="mb-4 flex items-center justify-between">
             <Link
@@ -404,7 +428,12 @@ export default function CourseUnitsPage() {
                 {t("New course unit")}
               </button>
               <button
-                onClick={() => load(isAdmin)}
+                onClick={() => {
+                  // Issue #75: same page-1-reload-but-stale-pager fix as
+                  // the create/update reload above.
+                  setPageOffset(0);
+                  void load(isAdmin);
+                }}
                 disabled={loading}
                 className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
                            border border-[var(--border)] text-[var(--muted-foreground)]
@@ -489,6 +518,21 @@ export default function CourseUnitsPage() {
           )}
         </div>
 
+        {totalCount > PAGE_LIMIT && (
+          <div className="mt-2 rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-sm">
+            <Pagination
+              total={totalCount}
+              limit={PAGE_LIMIT}
+              offset={pageOffset}
+              disabled={loading}
+              onPageChange={(newOffset) => {
+                setPageOffset(newOffset);
+                void load(isAdmin, newOffset, /* includeUsers */ false);
+              }}
+            />
+          </div>
+        )}
+
         {archivedUnits.length > 0 && (
           <div className="mt-4 rounded-2xl border border-[var(--border)] bg-[var(--card)] overflow-hidden shadow-sm">
             <button
@@ -520,10 +564,6 @@ export default function CourseUnitsPage() {
             )}
           </div>
         )}
-
-        <p className="mt-8 text-center text-xs text-[var(--muted-foreground)]">
-          {t("DeepTutor Admin · Course Units")}
-        </p>
       </div>
 
       <ConfirmDialog
@@ -540,7 +580,7 @@ export default function CourseUnitsPage() {
           <div className="space-y-2">
             <p>
               {t(
-                "This permanently removes “{{name}}” along with all its enrollments, assignments, and student submissions. This cannot be undone.",
+                "This permanently removes “{{name}}” along with all its enrollments, assignments, and student submissions. This cannot be undone.",
                 { name: deleteTarget.name },
               )}
             </p>

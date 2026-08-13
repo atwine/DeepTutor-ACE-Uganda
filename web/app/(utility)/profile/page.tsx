@@ -195,8 +195,17 @@ export default function ProfilePage() {
   }, []);
 
   const handleSignOut = useCallback(async () => {
-    await logout();
-    router.replace("/login");
+    setError(null);
+    try {
+      await logout();
+      router.replace("/login");
+    } catch (err) {
+      // Issue #70: this used to be a bare `await logout()` inside a
+      // `void`-called handler, so a rejection (network error) vanished
+      // silently -- the user stayed on this page with no indication
+      // sign-out failed, which is a real risk on a shared/public device.
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }, [router]);
 
   const detailsDirty =
@@ -330,7 +339,7 @@ export default function ProfilePage() {
                         ? t("Administrator")
                         : isInstructor
                           ? t("Instructor")
-                          : t("User")}
+                          : t("Student")}
                     </span>
                   </div>
                   {joined && (

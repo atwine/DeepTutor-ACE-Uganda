@@ -225,7 +225,16 @@ function BookPageInner() {
 
   const handleDeleteBook = async (id: string) => {
     if (!confirm(t("Delete this book? This cannot be undone."))) return;
-    await bookApi.delete(id);
+    // This used to have no try/catch: a delete that failed (e.g. a stuck
+    // "compiling" book whose background worker briefly held a file open)
+    // produced an unhandled promise rejection with zero UI feedback -- the
+    // book just stayed in the list with no indication anything went wrong.
+    try {
+      await bookApi.delete(id);
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : t("Failed to delete book"));
+      return;
+    }
     if (selectedBookId === id) {
       setSelectedBookId(null);
       setDetail(null);
@@ -365,6 +374,22 @@ function BookPageInner() {
         durationMs: 8000,
       });
       console.error("regenerateBlock failed:", err);
+    } finally {
+      await loadBookDetail(detail.book.id);
+    }
+  };
+
+  const handleEditBlockContent = async (block: Block, body: string) => {
+    if (!detail || !selectedPage) return;
+    try {
+      await bookApi.editBlockContent(detail.book.id, selectedPage.id, block.id, body);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notify(`Edit block failed: ${msg}`, {
+        tone: "error",
+        durationMs: 8000,
+      });
+      console.error("editBlockContent failed:", err);
     } finally {
       await loadBookDetail(detail.book.id);
     }
@@ -561,6 +586,9 @@ function BookPageInner() {
                   !!compilingPageId && compilingPageId === selectedPage?.id
                 }
                 onRegenerateBlock={(block) => void handleRegenerateBlock(block)}
+                onEditBlockContent={(block, body) =>
+                  void handleEditBlockContent(block, body)
+                }
                 onDeleteBlock={(block) => void handleDeleteBlock(block)}
                 onMoveBlock={(block, dir) => void handleMoveBlock(block, dir)}
                 onChangeBlockType={(block, t) =>

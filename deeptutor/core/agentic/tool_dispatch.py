@@ -36,6 +36,7 @@ from deeptutor.core.trace import (
     new_call_id,
 )
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
+from deeptutor.services.config.runtime_settings import get_tool_execution_timeout_seconds
 from deeptutor.utils.json_parser import parse_json_response
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,11 @@ class DispatchOutcome:
     pause: bool = False
     pause_payload: dict[str, Any] | None = None
     pause_tool_call_id: str | None = None
+    # Issue #60: names of tools that reported failure this iteration (empty
+    # if every call succeeded). Lets the loop detect "the model keeps
+    # retrying the same failing tool" and fast-fail to a graceful finish
+    # instead of burning through the whole round budget on repeats.
+    failed_tool_names: list[str] = field(default_factory=list)
 
 
 async def dispatch_tool_calls(
@@ -423,15 +429,19 @@ async def execute_tool_call(
             ),
         )
     try:
-        result = await registry.execute(
-            tool_name,
-            # Withheld when there is nowhere to publish (a bare call with
-            # neither meta): tools branch on the sink being present to decide
-            # whether to do the work at all — ``rag`` installs a log-capture
-            # handler for it — so handing over one that discards everything is
-            # strictly worse than handing over none.
-            event_sink=_event_sink if status_meta is not None else None,
-            **tool_args,
+        result = await asyncio.wait_for(
+            registry.execute(
+                tool_name,
+                # Withheld when there is nowhere to publish (a bare call with
+                # neither meta): tools branch on the sink being present to
+                # decide whether to do the work at all — ``rag`` installs a
+                # log-capture handler for it — so handing over one that
+                # discards everything is strictly worse than handing over
+                # none.
+                event_sink=_event_sink if status_meta is not None else None,
+                **tool_args,
+            ),
+            timeout=get_tool_execution_timeout_seconds(),
         )
         if status_meta is not None:
             await stream.progress(
@@ -460,6 +470,40 @@ async def execute_tool_call(
             "metadata": result.metadata,
             "terminate_turn": getattr(result, "terminate_turn", False),
             "pause_for_user": getattr(result, "pause_for_user", None),
+        }
+    except TimeoutError:
+        # asyncio.wait_for cancels the inner call and raises TimeoutError
+        # (builtin since 3.11) rather than propagating whatever the tool was
+        # doing — a hung network request or a sandboxed exec that never
+        # exits would otherwise stall the whole turn (issue #83). Handled
+        # separately from the generic except below only so the message is
+        # accurate; the trace-closing and return shape are identical.
+        timeout_s = get_tool_execution_timeout_seconds()
+        logger.error("Tool %s timed out after %.0fs", tool_name, timeout_s)
+        if status_meta is not None:
+            emit = stream.error if retrieve_meta is not None else stream.progress
+            await emit(
+                (
+                    f"Retrieve timed out after {timeout_s:.0f}s"
+                    if retrieve_meta is not None
+                    else f"{tool_name} timed out after {timeout_s:.0f}s"
+                ),
+                source=source,
+                stage=stage,
+                metadata=derive_trace_metadata(
+                    status_meta,
+                    trace_kind="call_status",
+                    call_state="error",
+                    error=f"timeout after {timeout_s:.0f}s",
+                ),
+            )
+        return {
+            "result_text": f"Error executing {tool_name}: timed out after {timeout_s:.0f}s",
+            "success": False,
+            "sources": [],
+            "metadata": {"error": "timeout"},
+            "terminate_turn": False,
+            "pause_for_user": None,
         }
     except Exception as exc:
         # Unknown tool names arrive here too (the registry raises KeyError), so
@@ -531,6 +575,7 @@ async def _collect_outcome(
     pause = False
     pause_payload: dict[str, Any] | None = None
     pause_tool_call_id: str | None = None
+    failed_tool_names: list[str] = []
     suppress_ui_indices = suppress_ui_indices or set()
     for tool_index, ((tool_call_id, tool_name, _exec_args), result) in enumerate(
         zip(prepared, results, strict=False)
@@ -563,6 +608,8 @@ async def _collect_outcome(
         )
         if isinstance(tool_extra_meta, dict) and tool_extra_meta:
             tool_metadata_by_id[tool_call_id] = dict(tool_extra_meta)
+        if result.get("success") is False:
+            failed_tool_names.append(tool_name)
         if result.get("terminate_turn") and not terminate:
             terminate = True
             terminate_payload = {
@@ -588,4 +635,5 @@ async def _collect_outcome(
         pause=pause,
         pause_payload=pause_payload,
         pause_tool_call_id=pause_tool_call_id,
+        failed_tool_names=failed_tool_names,
     )

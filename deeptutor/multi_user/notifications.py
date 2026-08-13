@@ -118,10 +118,15 @@ async def mark_notification_read(notification_id: str, user_id: str) -> bool:
     notification read concurrently can't race each other). Idempotent: a
     duplicate mark-read for the same user+notification just no-ops, since
     `NotificationRead` has a unique constraint on (notification_id, user_id).
-    Returns False if the notification doesn't exist."""
+    Returns False if the notification doesn't exist, or if the caller isn't
+    approved-enrolled in its course unit (issue #67) — matching the same
+    `is_approved_student_of` guard `list_notifications_for_user` already
+    applies to reads."""
     async with session_scope() as session:
         notification = await session.get(Notification, notification_id)
         if notification is None:
+            return False
+        if not await is_approved_student_of(user_id, notification.course_unit_id):
             return False
 
         existing_result = await session.execute(

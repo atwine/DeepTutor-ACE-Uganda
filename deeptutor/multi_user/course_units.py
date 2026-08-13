@@ -15,15 +15,24 @@ routers only gain ``await``, no logic changes.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from deeptutor.services.db import session_scope
-from deeptutor.services.db.models import CourseUnit, CourseUnitInstructor, Enrollment, Submission
+from deeptutor.services.db.models import (
+    CourseMaterial,
+    CourseUnit,
+    CourseUnitInstructor,
+    Enrollment,
+    Submission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +41,91 @@ logger = logging.getLogger(__name__)
 # named constant so it's easy to tune without hunting through if-statements.
 # Instructors and admins are never blocked (archival access stays forever).
 COURSE_END_GRACE_PERIOD_DAYS = 7
+
+
+_SYNC_KB_GRANT_RETRIES = 3
+_SYNC_KB_GRANT_RETRY_DELAY_SECONDS = 0.5
+
+
+async def _sync_course_kb_grant(user_id: str, kb_name: str | None, *, grant_access: bool) -> None:
+    """Issue #57: bridge enrollment to course-material RAG access.
+
+    A course's knowledge base lives in the admin workspace's KB store
+    (``_provision_course_kb``), so an enrolled student's own per-user
+    ``resolve_kb()``/``list_visible_knowledge_bases()`` check never
+    authorized it — materials indexed correctly, but chat could never
+    retrieve them for a student, matching the existing admin-assigned-KB
+    grant mechanism used elsewhere (``load_grant``/``save_grant`` in
+    ``grants.py``). Called on every enrollment-status transition that
+    grants or revokes course access; a no-op if the course has no KB
+    provisioned yet, or the user is an admin (admins already see every
+    KB and cannot hold a grants file — see ``save_grant``).
+
+    Issue #62: this runs after the enrollment DB transaction has already
+    committed, so a failure here can't be rolled back — but a *revoke*
+    failing silently fails open (a withdrawn student keeps chat access to
+    the course's materials with nothing in the UI hinting anything is
+    wrong), which is worse than a *grant* failing silently (a newly
+    enrolled student just can't retrieve materials yet). Retries a few
+    times for both directions since the underlying write is a plain file
+    write that can hit a transient disk hiccup; only a revoke that's still
+    failing after retries is escalated by raising, so the caller/endpoint
+    surfaces it instead of the access grant quietly drifting out of sync
+    with the enrollment status forever.
+    """
+    if not kb_name:
+        return
+    last_exc: Exception | None = None
+    for attempt in range(_SYNC_KB_GRANT_RETRIES):
+        try:
+            from .grants import load_grant, save_grant
+            from .identity import get_user_by_id
+
+            record = await get_user_by_id(user_id)
+            if record is None or str(record[1].get("role") or "user") == "admin":
+                return
+            grant = load_grant(user_id)
+            kb_list = grant.setdefault("knowledge_bases", [])
+            existing = [item for item in kb_list if str(item.get("name") or "") == kb_name]
+            if grant_access:
+                if not existing:
+                    kb_list.append({"name": kb_name, "resource_id": f"admin:kb:{kb_name}"})
+                    await save_grant(user_id, grant)
+            elif existing:
+                grant["knowledge_bases"] = [
+                    item for item in kb_list if str(item.get("name") or "") != kb_name
+                ]
+                await save_grant(user_id, grant)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _SYNC_KB_GRANT_RETRIES - 1:
+                await asyncio.sleep(_SYNC_KB_GRANT_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if grant_access:
+        logger.warning(
+            "Failed to grant course KB access for user %s, kb %s after %d attempts",
+            user_id,
+            kb_name,
+            _SYNC_KB_GRANT_RETRIES,
+            exc_info=last_exc,
+        )
+        return
+    logger.error(
+        "Failed to revoke course KB access for user %s, kb %s after %d attempts — "
+        "this student may still be able to retrieve this course's materials via chat",
+        user_id,
+        kb_name,
+        _SYNC_KB_GRANT_RETRIES,
+        exc_info=last_exc,
+    )
+    raise RuntimeError(
+        f"Enrollment change saved, but revoking course-material chat access for "
+        f"user {user_id} failed after {_SYNC_KB_GRANT_RETRIES} attempts. Their "
+        f"enrollment status is updated correctly, but they may still be able to "
+        f"retrieve this course's materials via chat — please retry or check "
+        f"manually."
+    ) from last_exc
 
 
 def new_course_unit_id() -> str:
@@ -44,6 +138,60 @@ def new_enrollment_id() -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def new_material_id() -> str:
+    return f"mat_{uuid4().hex}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #3: Auto-provision a course-specific RAG knowledge base
+# ---------------------------------------------------------------------------
+
+
+def _provision_course_kb(unit_id: str) -> str | None:
+    """Provision an empty KB named ``course_<unit_id>`` in the admin workspace's
+    knowledge-bases root, using the same initializer the KB create endpoint uses
+    (see ``deeptutor/api/routers/knowledge.py:create_knowledge_base`` and
+    ``deeptutor/knowledge/initializer.py:KnowledgeBaseInitializer``).
+
+    Returns the KB name on success, or ``None`` on failure (the caller --
+    ``create_course_unit`` -- does NOT block on a provisioning failure; it logs
+    a warning and leaves ``kb_name`` as None so it can be provisioned later).
+    The KB is created with the default RAG provider and no initial documents --
+    materials are indexed incrementally as instructors upload them.
+    """
+    try:
+        from deeptutor.knowledge.initializer import KnowledgeBaseInitializer
+        from deeptutor.knowledge.progress_tracker import ProgressTracker
+        from deeptutor.multi_user.knowledge_access import admin_kb_base_dir
+
+        kb_name = f"course_{unit_id}"
+        base_dir_path = admin_kb_base_dir().resolve()
+        base_dir = str(base_dir_path)
+        # ProgressTracker joins base_dir / kb_name internally, so it needs a
+        # Path, not the str KnowledgeBaseInitializer expects.
+        progress_tracker = ProgressTracker(kb_name, base_dir_path)
+        initializer = KnowledgeBaseInitializer(
+            kb_name=kb_name,
+            base_dir=base_dir,
+            progress_tracker=progress_tracker,
+        )
+        # create_directory_structure mkdir-s raw/ and registers the KB in
+        # kb_config.json with an "initializing" status -- no documents are
+        # processed here (the KB starts empty; materials are added later).
+        initializer.create_directory_structure()
+        # Flip the KB to "ready" since there are no documents to index.
+        from deeptutor.knowledge.manager import KnowledgeBaseManager
+
+        manager = KnowledgeBaseManager(base_dir=base_dir)
+        manager.update_kb_status(name=kb_name, status="ready")
+        return kb_name
+    except Exception as exc:
+        logger.warning(
+            "Failed to auto-provision course KB for unit %s: %s", unit_id, exc
+        )
+        return None
 
 
 def _unit_to_dict(unit: CourseUnit) -> dict[str, Any]:
@@ -59,6 +207,9 @@ def _unit_to_dict(unit: CourseUnit) -> dict[str, Any]:
         "is_archived": bool(unit.is_archived),
         "instructor_ids": [i.instructor_id for i in unit.instructors],
         "created_at": unit.created_at.isoformat() if unit.created_at else "",
+        # Issue #3: the auto-provisioned KB name for this course unit. "" when
+        # no KB has been provisioned yet (existing units or a failed provision).
+        "kb_name": unit.kb_name or "",
     }
 
 
@@ -71,6 +222,12 @@ def _enrollment_to_dict(enrollment: Enrollment) -> dict[str, Any]:
         "status": enrollment.status,
         "created_at": enrollment.created_at.isoformat() if enrollment.created_at else "",
         "approved_at": enrollment.approved_at.isoformat() if enrollment.approved_at else "",
+        # Issue #4: when the student completed the unit (all published
+        # assignments submitted+graded). "" means not yet completed.
+        "completed_at": enrollment.completed_at.isoformat() if enrollment.completed_at else "",
+        # When the student left (unenroll, or a confirmed leave request).
+        # "" for every status other than "withdrawn".
+        "withdrawn_at": enrollment.withdrawn_at.isoformat() if enrollment.withdrawn_at else "",
     }
 
 
@@ -91,6 +248,11 @@ async def create_course_unit(
     unit_id = new_course_unit_id()
     now = datetime.now(timezone.utc)
     clean_ids = [str(uid) for uid in instructor_ids if str(uid).strip()]
+    # Issue #3: Auto-provision a course-specific RAG KB. Done before the DB
+    # insert so the KB name can be stored on the CourseUnit row in one write.
+    # Failures are non-fatal -- the unit is still created with kb_name=None and
+    # the KB can be provisioned later (see ``provision_course_kb_for_unit``).
+    kb_name = _provision_course_kb(unit_id)
     async with session_scope() as session:
         unit = CourseUnit(
             id=unit_id,
@@ -100,6 +262,7 @@ async def create_course_unit(
             start_date=start_date or None,
             end_date=end_date or None,
             created_at=now,
+            kb_name=kb_name,
         )
         session.add(unit)
         await session.flush()
@@ -111,16 +274,29 @@ async def create_course_unit(
     return _unit_to_dict(unit)
 
 
-async def list_course_units() -> list[dict[str, Any]]:
+async def list_course_units(
+    *, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]]:
+    """limit=0 means unbounded — for callers that genuinely need every
+    course unit (the catalog, instructor stats/reports), not a page of
+    them. Every *paginated* caller passes an explicit positive limit."""
     async with session_scope() as session:
-        result = await session.execute(
-            select(CourseUnit).order_by(CourseUnit.created_at)
+        stmt = (
+            select(CourseUnit)
+            .options(selectinload(CourseUnit.instructors))
+            .order_by(CourseUnit.created_at)
         )
+        if limit > 0:
+            stmt = stmt.limit(limit).offset(offset)
+        result = await session.execute(stmt)
         units = result.scalars().unique().all()
-        # Eagerly load instructors
-        for u in units:
-            await session.refresh(u, ["instructors"])
     return [_unit_to_dict(u) for u in units]
+
+
+async def count_course_units() -> int:
+    async with session_scope() as session:
+        result = await session.execute(select(func.count(CourseUnit.id)))
+        return int(result.scalar() or 0)
 
 
 async def get_course_unit(course_unit_id: str) -> dict[str, Any] | None:
@@ -293,37 +469,70 @@ async def is_approved_student_of(user_id: str, course_unit_id: str) -> bool:
         return True
 
 
-async def list_course_units_for_instructor(user_id: str) -> list[dict[str, Any]]:
+async def list_course_units_for_instructor(
+    user_id: str, *, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]]:
+    """limit=0 means unbounded — see list_course_units's docstring."""
     async with session_scope() as session:
-        result = await session.execute(
+        stmt = (
             select(CourseUnit)
+            .options(selectinload(CourseUnit.instructors))
             .join(CourseUnitInstructor)
             .where(CourseUnitInstructor.instructor_id == str(user_id))
             .order_by(CourseUnit.created_at)
         )
+        if limit > 0:
+            stmt = stmt.limit(limit).offset(offset)
+        result = await session.execute(stmt)
         units = result.scalars().unique().all()
-        for u in units:
-            await session.refresh(u, ["instructors"])
     return [_unit_to_dict(u) for u in units]
 
 
-async def list_course_units_for_student(user_id: str) -> list[dict[str, Any]]:
+async def count_course_units_for_instructor(user_id: str) -> int:
+    async with session_scope() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(CourseUnit)
+            .join(CourseUnitInstructor)
+            .where(CourseUnitInstructor.instructor_id == str(user_id))
+        )
+        return int(result.scalar() or 0)
+
+
+async def list_course_units_for_student(
+    user_id: str, *, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]]:
     """Units ``user_id`` has *approved* access to — a pending request alone
     doesn't grant it."""
     async with session_scope() as session:
         result = await session.execute(
             select(CourseUnit)
+            .options(selectinload(CourseUnit.instructors))
             .join(Enrollment)
             .where(
                 Enrollment.user_id == str(user_id),
                 Enrollment.status == "approved",
             )
             .order_by(CourseUnit.created_at)
+            .limit(limit)
+            .offset(offset)
         )
         units = result.scalars().unique().all()
-        for u in units:
-            await session.refresh(u, ["instructors"])
     return [_unit_to_dict(u) for u in units]
+
+
+async def count_course_units_for_student(user_id: str) -> int:
+    async with session_scope() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(CourseUnit)
+            .join(Enrollment)
+            .where(
+                Enrollment.user_id == str(user_id),
+                Enrollment.status == "approved",
+            )
+        )
+        return int(result.scalar() or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -355,17 +564,21 @@ async def enroll_student(course_unit_id: str, user_id: str) -> dict[str, Any] | 
             if existing.status != "approved":
                 existing.status = "approved"
                 existing.approved_at = now
-            return _enrollment_to_dict(existing)
-        enrollment = Enrollment(
-            id=new_enrollment_id(),
-            course_unit_id=course_unit_id,
-            user_id=str(user_id),
-            status="approved",
-            created_at=now,
-            approved_at=now,
-        )
-        session.add(enrollment)
-    return _enrollment_to_dict(enrollment)
+                existing.withdrawn_at = None  # re-enrolling a withdrawn student clears the mark
+            kb_name = unit.kb_name
+        else:
+            enrollment = Enrollment(
+                id=new_enrollment_id(),
+                course_unit_id=course_unit_id,
+                user_id=str(user_id),
+                status="approved",
+                created_at=now,
+                approved_at=now,
+            )
+            session.add(enrollment)
+            kb_name = unit.kb_name
+    await _sync_course_kb_grant(str(user_id), kb_name, grant_access=True)
+    return _enrollment_to_dict(existing if existing is not None else enrollment)
 
 
 class CourseUnitArchivedError(Exception):
@@ -378,9 +591,12 @@ class CourseUnitArchivedError(Exception):
 
 async def request_enrollment(course_unit_id: str, user_id: str) -> dict[str, Any] | None:
     """Student-initiated: creates a ``pending`` enrollment for the instructor
-    to approve or reject. Idempotent — an existing enrollment of either
-    status (already pending, or already approved) is returned unchanged, so
-    re-requesting can't downgrade an approved student back to pending.
+    to approve or reject. Idempotent — an existing pending/approved/
+    leave_requested enrollment is returned unchanged, so re-requesting can't
+    downgrade an approved student back to pending. A ``withdrawn`` enrollment
+    (a student who previously left) is the one exception: it's revived back
+    to ``pending`` so they can rejoin, rather than staying stuck on their old
+    withdrawal record forever.
     Returns None if the course unit doesn't exist. Raises
     ``CourseUnitArchivedError`` (Round 3) if the unit is archived and the
     student has no existing enrollment to fall back on — an archived course
@@ -397,6 +613,19 @@ async def request_enrollment(course_unit_id: str, user_id: str) -> dict[str, Any
             )
         )
         existing = result.scalar_one_or_none()
+        if existing is not None and existing.status == "withdrawn":
+            # A withdrawn student is, for the archived-course rule, the same
+            # as someone who was never enrolled — rejoining an archived
+            # course still isn't allowed just because they happen to have a
+            # withdrawal record on file.
+            if unit.is_archived:
+                raise CourseUnitArchivedError(course_unit_id)
+            existing.status = "pending"
+            existing.created_at = now
+            existing.approved_at = None
+            existing.completed_at = None
+            existing.withdrawn_at = None
+            return _enrollment_to_dict(existing)
         if existing is not None:
             return _enrollment_to_dict(existing)
         if unit.is_archived:
@@ -431,6 +660,9 @@ async def approve_enrollment(course_unit_id: str, user_id: str) -> dict[str, Any
             return None
         enrollment.status = "approved"
         enrollment.approved_at = now
+        unit = await session.get(CourseUnit, course_unit_id)
+        kb_name = unit.kb_name if unit is not None else None
+    await _sync_course_kb_grant(str(user_id), kb_name, grant_access=True)
     return _enrollment_to_dict(enrollment)
 
 
@@ -466,11 +698,14 @@ async def request_leave(course_unit_id: str, user_id: str) -> dict[str, Any] | N
 
 
 async def approve_leave(course_unit_id: str, user_id: str) -> bool:
-    """B2: Instructor confirms a leave request — removes the Enrollment row
-    (the student stops appearing on the active roster and can't see/take new
-    assignments). Does NOT delete the student's existing Submission rows —
+    """B2: Instructor confirms a leave request — marks the Enrollment
+    ``withdrawn`` (the student stops appearing on the active roster and
+    can't see/take new assignments), rather than deleting the row, so this
+    withdrawal shows up in completion/dropout history instead of silently
+    disappearing. Does NOT delete the student's existing Submission rows —
     those stay for grading history/audit integrity (see B2 decision in
     DEVIN_LOG.md). Returns False if there is no leave_requested enrollment."""
+    now = datetime.now(timezone.utc)
     async with session_scope() as session:
         result = await session.execute(
             select(Enrollment).where(
@@ -482,7 +717,11 @@ async def approve_leave(course_unit_id: str, user_id: str) -> bool:
         enrollment = result.scalar_one_or_none()
         if enrollment is None:
             return False
-        await session.delete(enrollment)
+        enrollment.status = "withdrawn"
+        enrollment.withdrawn_at = now
+        unit = await session.get(CourseUnit, course_unit_id)
+        kb_name = unit.kb_name if unit is not None else None
+    await _sync_course_kb_grant(str(user_id), kb_name, grant_access=False)
     return True
 
 
@@ -502,6 +741,9 @@ async def reject_leave(course_unit_id: str, user_id: str) -> dict[str, Any] | No
         if enrollment is None:
             return None
         enrollment.status = "approved"
+        unit = await session.get(CourseUnit, course_unit_id)
+        kb_name = unit.kb_name if unit is not None else None
+    await _sync_course_kb_grant(str(user_id), kb_name, grant_access=True)
     return _enrollment_to_dict(enrollment)
 
 
@@ -519,23 +761,77 @@ async def list_leave_requests_for_course(course_unit_id: str) -> list[dict[str, 
 
 
 async def unenroll_student(course_unit_id: str, user_id: str) -> bool:
+    """Remove a student from a course unit.
+
+    An enrollment that was ever ``approved`` or ``leave_requested`` is a real
+    withdrawal — the row is kept with status set to ``withdrawn`` and
+    ``withdrawn_at`` stamped, rather than deleted, so completion/dropout
+    history survives (Enrollment/Submission rows used to vanish together on
+    unenroll, silently erasing that student's record from every course-level
+    stat). A merely ``pending`` request that's being pulled (e.g. rejecting a
+    join request, or an instructor un-enrolling someone who never actually
+    started) has no history worth keeping, so it's still hard-deleted.
+    """
+    now = datetime.now(timezone.utc)
     async with session_scope() as session:
         result = await session.execute(
-            delete(Enrollment).where(
+            select(Enrollment).where(
                 Enrollment.course_unit_id == course_unit_id,
                 Enrollment.user_id == str(user_id),
             )
         )
-        return result.rowcount > 0
+        enrollment = result.scalar_one_or_none()
+        if enrollment is None:
+            return False
+        if enrollment.status in ("approved", "leave_requested"):
+            enrollment.status = "withdrawn"
+            enrollment.withdrawn_at = now
+        else:
+            await session.delete(enrollment)
+        unit = await session.get(CourseUnit, course_unit_id)
+        kb_name = unit.kb_name if unit is not None else None
+    await _sync_course_kb_grant(str(user_id), kb_name, grant_access=False)
+    return True
 
 
-async def list_enrollments_for_course(course_unit_id: str) -> list[dict[str, Any]]:
+async def list_enrollments_for_course(
+    course_unit_id: str, *, status: str = "", limit: int = 0, offset: int = 0
+) -> list[dict[str, Any]]:
+    """Enrollments for a course unit. Issue #41: optional limit/offset
+    for pagination — when limit=0 (default), returns all rows (backward
+    compatible with callers that don't paginate).
+
+    ``status`` filters at the DB level *before* limit/offset are applied —
+    a caller that both paginates AND filters by status (the roster
+    endpoint) must pass status here rather than filtering the returned
+    page in Python, or the reported total (from
+    :func:`count_enrollments_for_course`, itself status-filtered) won't
+    match how many of the returned rows actually pass the filter. Also
+    orders by ``created_at`` so paginated results are deterministic —
+    without an ORDER BY, Postgres makes no promise about row order across
+    separate LIMIT/OFFSET calls.
+    """
     async with session_scope() as session:
-        result = await session.execute(
-            select(Enrollment).where(Enrollment.course_unit_id == course_unit_id)
-        )
+        stmt = select(Enrollment).where(Enrollment.course_unit_id == course_unit_id)
+        if status:
+            stmt = stmt.where(Enrollment.status == status)
+        stmt = stmt.order_by(Enrollment.created_at)
+        if limit > 0:
+            stmt = stmt.limit(limit).offset(offset)
+        result = await session.execute(stmt)
         enrollments = result.scalars().all()
     return [_enrollment_to_dict(e) for e in enrollments]
+
+
+async def count_enrollments_for_course(course_unit_id: str, *, status: str = "") -> int:
+    async with session_scope() as session:
+        stmt = select(func.count(Enrollment.id)).where(
+            Enrollment.course_unit_id == course_unit_id
+        )
+        if status:
+            stmt = stmt.where(Enrollment.status == status)
+        result = await session.execute(stmt)
+        return int(result.scalar() or 0)
 
 
 async def list_enrollments_for_student(user_id: str) -> list[dict[str, Any]]:
@@ -548,35 +844,408 @@ async def list_enrollments_for_student(user_id: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Issue #4: Automatic course-unit completion tracking
+# ---------------------------------------------------------------------------
+
+
+async def check_and_mark_completion(
+    course_unit_id: str,
+    user_id: str,
+    *,
+    published_assignments: list[dict[str, Any]] | None = None,
+    submission_batch: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> str:
+    """Issue #4: A student is automatically marked complete with a course
+    unit when every published assignment for it has a graded submission from
+    them. Submissions are always graded at submit time (``Submission.score``
+    is NOT NULL — see assignments.py's submit flow), so "submitted AND
+    graded" reduces to "has a latest submission". A unit with no published
+    assignments is never auto-completed (there's no work to finish).
+
+    When the check passes, ``enrollment.completed_at`` is set to now (if not
+    already set — idempotent) and the ISO timestamp is returned. Returns ""
+    when the student is not yet complete or has no enrollment. Completion is
+    additive: it never revokes the student's read access to course materials.
+
+    Issue #31: The optional ``published_assignments`` and ``submission_batch``
+    parameters let callers that already have this data (e.g.
+    ``build_gradebook``) skip the per-student re-fetch — eliminating the
+    secondary N+1 that was the real bottleneck. When omitted, the function
+    falls back to fetching them itself (the original behavior, used by the
+    submit flow where only one student is checked).
+    """
+    # Local import to keep the module's import graph unchanged at load time
+    # (assignments.py does not import this module, so there's no cycle, but
+    # mirroring the lazy-import pattern already used elsewhere in this layer
+    # keeps the diff minimal and avoids any load-order surprise).
+    from .assignments import get_latest_submission, list_assignments_for_course
+
+    if published_assignments is not None:
+        published = published_assignments
+    else:
+        published = [
+            a for a in await list_assignments_for_course(course_unit_id) if a["status"] == "published"
+        ]
+    # Issue #64: the early-return below is for "no published assignments at
+    # all — nothing to finish", not "every published assignment happens to
+    # be optional." With zero required assignments the completion rule
+    # ("every required published assignment has a graded submission") is
+    # vacuously true, so a course made entirely of optional/bonus work
+    # should still be completable — the loop below already handles that
+    # correctly (falls straight through) once this only guards on
+    # `published` being empty.
+    if not published:
+        return ""
+    # Issue #32: optional/bonus assignments don't block completion — only
+    # required (non-optional) published assignments must be submitted.
+    required = [a for a in published if not a.get("is_optional", False)]
+    for assignment in required:
+        if submission_batch is not None:
+            submission = submission_batch.get((assignment["id"], str(user_id)))
+        else:
+            submission = await get_latest_submission(assignment["id"], user_id)
+        if submission is None:
+            return ""  # not all required assignments submitted+graded yet
+    # All published assignments have a graded submission — mark complete.
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Enrollment).where(
+                Enrollment.course_unit_id == course_unit_id,
+                Enrollment.user_id == str(user_id),
+            )
+        )
+        enrollment = result.scalar_one_or_none()
+        if enrollment is None:
+            return ""
+        if enrollment.completed_at is None:
+            enrollment.completed_at = now
+            await session.flush()
+        return enrollment.completed_at.isoformat() if enrollment.completed_at else ""
+
+
+async def check_and_mark_completion_batch(
+    course_unit_id: str,
+    user_ids: list[str],
+    published_assignments: list[dict[str, Any]],
+    submission_batch: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, str]:
+    """Issue #31: Batched version of :func:`check_and_mark_completion` —
+    checks and marks completion for *all* students in a course unit in a
+    **single DB query** (one SELECT for all enrollments + one UPDATE for
+    newly-complete ones), instead of one session per student.
+
+    Returns a dict mapping ``user_id`` → ``completed_at`` ISO string (or
+    ``""`` if not complete). The caller (``build_gradebook``) uses this to
+    avoid the per-student N+1 that was the real bottleneck.
+    """
+    if not published_assignments or not user_ids:
+        return {uid: "" for uid in user_ids}
+
+    # Issue #32: optional/bonus assignments don't block completion — only
+    # required (non-optional) published assignments must be submitted.
+    # Issue #64: no early-return when required_assignments is empty (that
+    # used to unconditionally report every student as incomplete for a
+    # course made entirely of optional/bonus work) — the top-level guard
+    # above already handles "no published assignments at all", and an
+    # empty assignment_ids list makes the all() check below vacuously
+    # True for everyone, which is the correct completion result.
+    required_assignments = [a for a in published_assignments if not a.get("is_optional", False)]
+    assignment_ids = [a["id"] for a in required_assignments]
+
+    # Determine which students have submitted all published assignments —
+    # pure dict lookups, no DB access.
+    complete_user_ids: list[str] = []
+    for uid in user_ids:
+        all_submitted = all(
+            submission_batch.get((aid, uid)) is not None
+            for aid in assignment_ids
+        )
+        if all_submitted:
+            complete_user_ids.append(uid)
+
+    if not complete_user_ids:
+        return {uid: "" for uid in user_ids}
+
+    # Single query: fetch all enrollments for complete students, and mark
+    # the ones that aren't already marked in the same transaction.
+    now = datetime.now(timezone.utc)
+    result_map: dict[str, str] = {uid: "" for uid in user_ids}
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Enrollment).where(
+                    Enrollment.course_unit_id == course_unit_id,
+                    Enrollment.user_id.in_([str(uid) for uid in complete_user_ids]),
+                )
+            )
+        ).scalars().all()
+
+        for enrollment in rows:
+            if enrollment.completed_at is None:
+                enrollment.completed_at = now
+                await session.flush()
+            if enrollment.completed_at:
+                result_map[enrollment.user_id] = enrollment.completed_at.isoformat()
+
+    return result_map
+
+
+# ---------------------------------------------------------------------------
 # User-deletion cascade sweep (B5)
 # ---------------------------------------------------------------------------
 
 
-async def delete_user_data(user_id: str) -> None:
-    """Sweep all Postgres rows referencing ``user_id`` — enrollments and
-    submissions — when a user is deleted from the JSON identity store.
+async def delete_user_data(session: AsyncSession, user_id: str) -> None:
+    """Explicitly delete a user's Enrollment and Submission rows, as a
+    deliberate step of deleting their account.
 
-    The ``Enrollment`` and ``Submission`` tables have no FK to a users table
-    on purpose (identity stays in JSON, out of scope for the DB migration —
-    see ``models.py``'s ``CourseUnitInstructor`` docstring for the rationale).
-    Without this sweep, deleting a user leaves those rows pointing at a
-    now-nonexistent ``user_id`` forever — orphaned roster entries and
-    submission references that break gradebook/roster rendering.
+    ``Enrollment.user_id`` has an ON DELETE CASCADE foreign key, so it
+    would clean up on its own — but ``Submission.user_id`` is deliberately
+    RESTRICT, not CASCADE (grade history should never vanish as a silent
+    side effect of an account deletion — see that column's comment in
+    models.py). That means submissions MUST be deleted explicitly, by a
+    caller making that decision on purpose, before the account itself can
+    be deleted at all; the database will refuse the account deletion
+    otherwise. This function is that explicit, deliberate step.
 
-    Submission rows are deleted (not kept) because a deleted user's
-    submissions are meaningless for grading — the student is gone, the
-    gradebook can't render their name, and leaving them pollutes the
-    instructor's submission list. This matches the existing
-    ``delete_course_unit`` cascade behavior for submissions.
+    Takes the caller's own ``session`` (issue #81) rather than opening its
+    own ``session_scope()``: this sweep and the ``User`` row delete in
+    ``identity.py:delete_user()`` must commit or roll back together — a
+    process crash between two separate transactions used to be able to
+    leave a user's enrollments/submissions gone but the account itself
+    still present.
+    """
+    await session.execute(
+        delete(Enrollment).where(Enrollment.user_id == str(user_id))
+    )
+    await session.execute(
+        delete(Submission).where(Submission.user_id == str(user_id))
+    )
 
-    Called from ``identity.py:delete_user()`` after the JSON record is
-    removed. Does NOT add a FK/cascade at the DB level — this stays an
-    application-level sweep to match how the rest of this subsystem works.
+# ---------------------------------------------------------------------------
+# Issue #3: Course materials (instructor uploads + course-specific RAG)
+# ---------------------------------------------------------------------------
+
+
+# Supported file types for course materials. Mirrors the API contract's
+# file_type enum. Extensions not in the RAG FileTypeRouter's supported set
+# (e.g. .ipynb) are still accepted as uploads -- they're stored and downloadable
+# but won't be indexed into the RAG KB (ingestion_status stays "pending").
+_COURSE_MATERIAL_FILE_TYPES: dict[str, str] = {
+    ".ipynb": "ipynb",
+    ".pdf": "pdf",
+    ".docx": "docx",
+    ".pptx": "pptx",
+    ".xlsx": "xlsx",
+    ".md": "md",
+    ".markdown": "md",
+    ".txt": "txt",
+    ".text": "txt",
+}
+
+
+def _file_type_for_filename(filename: str) -> str:
+    """Map a filename's extension to the CourseMaterial.file_type enum.
+    Returns ``"other"`` for anything not in the explicit mapping above."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _COURSE_MATERIAL_FILE_TYPES.get(f".{ext}", "other")
+
+
+def _material_to_dict(material: CourseMaterial) -> dict[str, Any]:
+    """Serialize a CourseMaterial ORM instance to the API response shape."""
+    return {
+        "id": material.id,
+        "course_unit_id": material.course_unit_id,
+        "filename": material.filename,
+        "file_type": material.file_type,
+        "size_bytes": material.size_bytes,
+        "status": material.status,
+        "uploaded_at": material.uploaded_at.isoformat() if material.uploaded_at else "",
+        "published_at": material.published_at.isoformat() if material.published_at else None,
+        "ingestion_status": material.ingestion_status,
+    }
+
+
+async def provision_course_kb_for_unit(course_unit_id: str) -> dict[str, Any] | None:
+    """Provision (or re-provision) the course-specific KB for an existing
+    course unit that was created before this feature (``kb_name`` is None).
+    Stores the KB name on the CourseUnit row. Returns the updated unit dict,
+    or None if the course unit doesn't exist or already has a KB provisioned."""
+    async with session_scope() as session:
+        unit = await session.get(CourseUnit, course_unit_id)
+        if unit is None or unit.kb_name:
+            return None
+        kb_name = _provision_course_kb(course_unit_id)
+        if kb_name is None:
+            return None
+        unit.kb_name = kb_name
+        await session.flush()
+        await session.refresh(unit, ["instructors"])
+    return _unit_to_dict(unit)
+
+
+async def get_course_kb_name(course_unit_id: str) -> str | None:
+    """Return the auto-provisioned KB name for a course unit, or None if the
+    unit doesn't exist or has no KB provisioned yet."""
+    async with session_scope() as session:
+        unit = await session.get(CourseUnit, course_unit_id)
+        if unit is None:
+            return None
+        return unit.kb_name
+
+
+async def create_material_record(
+    course_unit_id: str,
+    filename: str,
+    file_path: str,
+    size_bytes: int,
+) -> dict[str, Any]:
+    """Create a CourseMaterial record with status='draft' and
+    ingestion_status='pending'. Returns the serialized material dict."""
+    now = datetime.now(timezone.utc)
+    material = CourseMaterial(
+        id=new_material_id(),
+        course_unit_id=course_unit_id,
+        filename=filename,
+        file_type=_file_type_for_filename(filename),
+        file_path=file_path,
+        size_bytes=size_bytes,
+        status="draft",
+        uploaded_at=now,
+        published_at=None,
+        ingestion_status="pending",
+    )
+    async with session_scope() as session:
+        session.add(material)
+        await session.flush()
+    return _material_to_dict(material)
+
+
+async def list_materials_for_course(
+    course_unit_id: str, *, include_draft: bool = True
+) -> list[dict[str, Any]]:
+    """List course materials. When ``include_draft`` is False (student view),
+    only published materials are returned."""
+    async with session_scope() as session:
+        query = select(CourseMaterial).where(
+            CourseMaterial.course_unit_id == course_unit_id
+        )
+        if not include_draft:
+            query = query.where(CourseMaterial.status == "published")
+        query = query.order_by(CourseMaterial.uploaded_at)
+        result = await session.execute(query)
+        materials = result.scalars().all()
+    return [_material_to_dict(m) for m in materials]
+
+
+async def get_material(course_unit_id: str, material_id: str) -> dict[str, Any] | None:
+    """Get a single course material by id. Returns None if not found or if it
+    doesn't belong to the given course unit."""
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None or material.course_unit_id != course_unit_id:
+            return None
+        return _material_to_dict(material)
+
+
+async def get_material_orm(
+    course_unit_id: str, material_id: str
+) -> CourseMaterial | None:
+    """Get the raw CourseMaterial ORM instance (for file-path lookups in the
+    download/delete endpoints). Returns None if not found or mismatched."""
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None or material.course_unit_id != course_unit_id:
+            return None
+        return material
+
+
+async def publish_material(course_unit_id: str, material_id: str) -> dict[str, Any] | None:
+    """Set a material's status to 'published' and record published_at. Returns
+    None if the material doesn't exist or doesn't belong to this course unit."""
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None or material.course_unit_id != course_unit_id:
+            return None
+        material.status = "published"
+        material.published_at = now
+        await session.flush()
+    return _material_to_dict(material)
+
+
+async def unpublish_material(course_unit_id: str, material_id: str) -> dict[str, Any] | None:
+    """Revert a material's status to 'draft' and clear published_at. Returns
+    None if the material doesn't exist or doesn't belong to this course unit."""
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None or material.course_unit_id != course_unit_id:
+            return None
+        material.status = "draft"
+        material.published_at = None
+        await session.flush()
+    return _material_to_dict(material)
+
+
+async def delete_material(course_unit_id: str, material_id: str) -> bool:
+    """Delete a CourseMaterial DB record. Returns False if not found or
+    mismatched. The caller is responsible for removing the physical file from
+    the KB's raw/ directory (see the DELETE endpoint in router.py)."""
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None or material.course_unit_id != course_unit_id:
+            return False
+        await session.delete(material)
+    return True
+
+
+async def update_ingestion_status(
+    material_id: str, status: str
+) -> None:
+    """Update a material's ingestion_status (pending -> indexing -> ready/failed).
+    Called by the background indexing task. Best-effort -- logs a warning if the
+    material no longer exists (e.g. deleted while indexing was in flight)."""
+    async with session_scope() as session:
+        material = await session.get(CourseMaterial, material_id)
+        if material is None:
+            logger.warning(
+                "Cannot update ingestion_status for material %s: not found", material_id
+            )
+            return
+        material.ingestion_status = status
+        await session.flush()
+
+
+async def recover_stuck_indexing_materials() -> int:
+    """Startup recovery for materials orphaned mid-index (issue #88).
+
+    ``_run_material_indexing`` sets ``ingestion_status="indexing"`` around
+    the actual indexing work and always updates it to ``ready``/``failed``
+    on the way out -- except that in-memory ``BackgroundTasks`` coroutine
+    cannot survive a process restart, OOM kill, or ungraceful shutdown. Any
+    material still reading ``"indexing"`` when this runs at the *next*
+    startup can only be one that was killed mid-flight during a previous
+    run (a live process never leaves that state set on its own without
+    finishing the try/except that clears it) -- no time threshold is
+    needed to tell "genuinely still indexing" apart from "stuck", since a
+    genuinely-still-indexing task cannot exist yet at the moment this
+    function runs, at the very start of a fresh process.
+
+    Resets to ``"failed"`` rather than back to ``"pending"``: silently
+    re-queuing indexing on every restart could retry the same
+    crash-inducing document forever. ``"failed"`` at least surfaces in the
+    instructor UI and lets them explicitly retry.
+
+    Returns the number of materials recovered.
     """
     async with session_scope() as session:
-        await session.execute(
-            delete(Enrollment).where(Enrollment.user_id == str(user_id))
+        result = await session.execute(
+            select(CourseMaterial).where(CourseMaterial.ingestion_status == "indexing")
         )
-        await session.execute(
-            delete(Submission).where(Submission.user_id == str(user_id))
-        )
+        stuck = result.scalars().all()
+        for material in stuck:
+            material.ingestion_status = "failed"
+        await session.flush()
+    return len(stuck)

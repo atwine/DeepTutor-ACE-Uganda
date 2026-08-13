@@ -27,6 +27,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -42,6 +43,43 @@ class Base(DeclarativeBase):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Identity — accounts (Issue #53)
+# ---------------------------------------------------------------------------
+
+
+class User(Base):
+    """Canonical user account. Replaces the JSON file identity store
+    (``deeptutor/multi_user/identity.py``'s old ``users.json``) — see Issue
+    #53. Field names mirror the JSON record shape 1:1 so the one-time
+    migration script is a straight copy, no field renaming."""
+
+    __tablename__ = "users"
+
+    # Keep the existing "u_<hex>" id format (and legacy sentinels like
+    # "env-admin") so callers that already store/compare these ids as opaque
+    # strings (JWTs, enrollments, submissions, instructor_ids lists) don't
+    # need to change.
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    # 'admin' | 'instructor' | 'user'
+    role: Mapped[str] = mapped_column(String, nullable=False, default="user", index=True)
+    full_name: Mapped[str] = mapped_column(String, nullable=False, default="")
+    registration_number: Mapped[str] = mapped_column(String, nullable=False, default="", index=True)
+    first_name: Mapped[str] = mapped_column(String, nullable=False, default="")
+    surname: Mapped[str] = mapped_column(String, nullable=False, default="")
+    gender: Mapped[str] = mapped_column(String, nullable=False, default="")
+    course: Mapped[str] = mapped_column(String, nullable=False, default="")
+    disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Avatar *marker* only ('' | 'icon:<name>:<color>' | 'img:<version>') —
+    # the actual image bytes stay on disk, keyed by id (see identity.py's
+    # get_avatar_file/save_avatar_file, which are out of scope for this
+    # migration).
+    avatar: Mapped[str] = mapped_column(String, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +113,12 @@ class CourseUnit(Base):
     # join-a-new-course catalog (see router.py's catalog endpoint).
     is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    # Issue #3: The auto-provisioned KB name for this course unit (e.g.
+    # ``course_cu_abc123``). Nullable for backward compat with existing course
+    # units created before this field existed -- can be provisioned later. The
+    # KB itself lives in the admin workspace's knowledge_bases root (see
+    # ``knowledge_access.admin_kb_base_dir``).
+    kb_name: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
 
     instructors: Mapped[list["CourseUnitInstructor"]] = relationship(
         back_populates="course_unit", cascade="all, delete-orphan"
@@ -88,23 +132,32 @@ class CourseUnit(Base):
     book_entries: Mapped[list["CourseBookEntry"]] = relationship(
         back_populates="course_unit", cascade="all, delete-orphan"
     )
+    materials: Mapped[list["CourseMaterial"]] = relationship(
+        back_populates="course_unit", cascade="all, delete-orphan"
+    )
 
 
 class CourseUnitInstructor(Base):
     """Many-to-many: was a plain JSON list column (`instructor_ids`) on the
-    course-unit record. `instructor_id` has no FK to a users table on
-    purpose — `identity.py` (accounts) is explicitly out of scope for this
-    migration (see the plan's scope section), so a deleted user's id can
-    linger here exactly as it can in today's JSON `instructor_ids` list —
-    a pre-existing gap, not one this migration introduces or is expected to
-    close."""
+    course-unit record.
+
+    `instructor_id` originally had no FK to `users` on purpose — accounts
+    were still a separate JSON file at the time, and a database FK can't
+    point at a file. Issue #53 moved accounts into this same database, so
+    that reason no longer applies; a real FK now enforces that this can
+    never point at an account that doesn't exist. ON DELETE CASCADE: if an
+    instructor's account is deleted, they're removed from any course they
+    were assigned to rather than leaving a dangling, invisible reference
+    (which is what happened before this FK existed)."""
 
     __tablename__ = "course_unit_instructors"
 
     course_unit_id: Mapped[str] = mapped_column(
         ForeignKey("course_units.id", ondelete="CASCADE"), primary_key=True
     )
-    instructor_id: Mapped[str] = mapped_column(String, primary_key=True)
+    instructor_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
 
     course_unit: Mapped[CourseUnit] = relationship(back_populates="instructors")
 
@@ -121,13 +174,31 @@ class Enrollment(Base):
         String, primary_key=True, default=lambda: f"en_{uuid.uuid4().hex}"
     )
     course_unit_id: Mapped[str] = mapped_column(
-        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    # ON DELETE CASCADE matches identity.delete_user's existing explicit
+    # sweep (it already deletes a user's Enrollment rows) — the FK just
+    # makes that guarantee real at the database level instead of relying on
+    # every deletion code path remembering to do it by hand.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     # 'pending' | 'approved' — matches Enrollment.status in course_units.py today.
     status: Mapped[str] = mapped_column(String, nullable=False, default="approved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Issue #4: Automatic course-unit completion tracking. Set when a student
+    # has submitted+graded every published assignment for the unit (see
+    # course_units.py's check_and_mark_completion). Nullable so existing
+    # enrollments default to "not completed" — completion is additive and
+    # never revokes read access to course materials.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When a previously-approved student leaves a course (admin/instructor
+    # unenroll, or a confirmed leave request), the row is no longer deleted —
+    # status moves to 'withdrawn' and this is set, so completion/dropout
+    # history survives instead of vanishing (see course_units.py's
+    # unenroll_student / approve_leave). NULL for every other status.
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     course_unit: Mapped[CourseUnit] = relationship(back_populates="enrollments")
 
@@ -179,6 +250,10 @@ class Assignment(Base):
     # (current behavior: attempt_limit is the only gate).
     is_major: Mapped[bool] = mapped_column(nullable=False, default=False)
     passing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Issue #32: Optional/bonus assignments don't block course completion.
+    # A student who skips an optional assignment is still marked complete
+    # as long as they've submitted all required (non-optional) assignments.
+    is_optional: Mapped[bool] = mapped_column(nullable=False, default=False)
 
     course_unit: Mapped[CourseUnit] = relationship(back_populates="assignments")
     submissions: Mapped[list["Submission"]] = relationship(
@@ -191,6 +266,14 @@ class Assignment(Base):
 
 class Submission(Base):
     __tablename__ = "submissions"
+    __table_args__ = (
+        # Issue #38: Composite index for queries that filter by both
+        # assignment_id AND user_id (get_latest_submission, count_submissions,
+        # get_latest_submissions_batch). The two single-column indexes below
+        # help individual filters but can't be combined efficiently by the
+        # planner for AND queries on both columns.
+        Index("ix_submissions_assignment_user", "assignment_id", "user_id"),
+    )
 
     id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: f"sub_{uuid.uuid4().hex}"
@@ -198,7 +281,18 @@ class Submission(Base):
     assignment_id: Mapped[str] = mapped_column(
         ForeignKey("assignments.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # Deliberately RESTRICT, not CASCADE, unlike every other user_id FK in
+    # this file: a Submission is a student's actual grade record, not a
+    # disposable pointer. identity.delete_user() explicitly deletes a
+    # user's submissions itself (a deliberate admin decision, made in the
+    # right order — see that function) before deleting the account, so
+    # RESTRICT never fires on that intended path. What it does stop is any
+    # OTHER code path — a bug, a one-off script, a raw DELETE FROM users —
+    # from silently wiping grade history as a side effect of removing an
+    # account. That has to fail loudly and be a deliberate, separate step.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
     # [{question_id: str, answer: str}, ...]
     answers: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
     # [{question_id, question, user_answer, is_correct, score, max_score,
@@ -208,7 +302,7 @@ class Submission(Base):
     )
     score: Mapped[float] = mapped_column(Float, nullable=False)
     max_score: Mapped[float] = mapped_column(Float, nullable=False)
-    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, index=True)
 
     assignment: Mapped[Assignment] = relationship(back_populates="submissions")
 
@@ -237,14 +331,23 @@ class AssignmentAccessGrant(Base):
     assignment_id: Mapped[str] = mapped_column(
         ForeignKey("assignments.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    # CASCADE: the grant is meaningless without the student it was made for.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
     # If set, the student gets this many *extra* attempts on top of the
     # assignment's base attempt_limit. NULL means no extra attempts granted.
     extra_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # If set, this student's personal deadline (overrides assignment.due_at).
     # NULL means the assignment's own due_at applies as normal.
     extended_due_at: Mapped[str | None] = mapped_column(String, nullable=True)
-    granted_by: Mapped[str] = mapped_column(String, nullable=False)
+    # Audit trail (who approved this exception), not a functional
+    # dependency — SET NULL rather than CASCADE, so deleting the admin/
+    # instructor who granted it doesn't take a *different* student's still-
+    # valid access grant down with it. Nullable to allow that.
+    granted_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     assignment: Mapped[Assignment] = relationship(back_populates="access_grants")
@@ -276,7 +379,7 @@ class Notification(Base):
         String, primary_key=True, default=lambda: f"notif_{uuid.uuid4().hex}"
     )
     course_unit_id: Mapped[str] = mapped_column(
-        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False, index=True
     )
     # e.g. "assignment_published" | "notes_published"
     kind: Mapped[str] = mapped_column(String, nullable=False)
@@ -305,9 +408,12 @@ class NotificationRead(Base):
         String, primary_key=True, default=lambda: f"nread_{uuid.uuid4().hex}"
     )
     notification_id: Mapped[str] = mapped_column(
-        ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    # CASCADE: a read-receipt for a deleted account is meaningless.
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
@@ -323,7 +429,7 @@ class CourseBookEntry(Base):
     book_id: Mapped[str] = mapped_column(String, primary_key=True)
     owner_id: Mapped[str] = mapped_column(String, nullable=False)
     course_unit_id: Mapped[str] = mapped_column(
-        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False, index=True
     )
     # 'draft' | 'published'
     status: Mapped[str] = mapped_column(String, nullable=False, default="draft")
@@ -331,3 +437,53 @@ class CourseBookEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     course_unit: Mapped[CourseUnit] = relationship(back_populates="book_entries")
+
+
+# ---------------------------------------------------------------------------
+# Issue #3 -- Course materials (instructor uploads + course-specific RAG)
+# ---------------------------------------------------------------------------
+
+
+class CourseMaterial(Base):
+    """An instructor-uploaded course material (PDF, notebook, book, ...) that
+    gets indexed into the course unit's auto-provisioned RAG knowledge base.
+
+    The physical file lives in the course KB's ``raw/`` directory; this table
+    is the index/pointer with a draft/publish workflow (instructors upload as
+    ``draft``, then publish to make it visible/downloadable to enrolled
+    students) and an ingestion-status tracker (``pending`` -> ``indexing`` ->
+    ``ready``/``failed``) for the background RAG indexing task."""
+
+    __tablename__ = "course_materials"
+
+    id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"mat_{uuid.uuid4().hex}"
+    )
+    course_unit_id: Mapped[str] = mapped_column(
+        ForeignKey("course_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Original filename as uploaded by the instructor (sanitized on save).
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    # One of: "ipynb", "pdf", "docx", "pptx", "xlsx", "md", "txt", "other".
+    file_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Relative path within the course KB's raw/ directory (e.g. "lab3.ipynb").
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 'draft' | 'published' -- publish workflow. Draft materials are only
+    # visible to instructors/admins; published materials are visible (and
+    # downloadable) to enrolled students.
+    status: Mapped[str] = mapped_column(String, nullable=False, default="draft")
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 'pending' | 'indexing' | 'ready' | 'failed' -- tracks the background RAG
+    # indexing task. ``pending`` right after upload, ``indexing`` while the
+    # DocumentAdder runs, ``ready`` on success, ``failed`` on error.
+    ingestion_status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending"
+    )
+
+    course_unit: Mapped[CourseUnit] = relationship(back_populates="materials")

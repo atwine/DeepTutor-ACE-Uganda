@@ -75,6 +75,7 @@ class InlineThinkFilter:
     """
 
     def __init__(self) -> None:
+        """Initialize the filter with an empty buffer and outside-think state."""
         self._buffer = ""
         self._in_think = False
 
@@ -125,10 +126,18 @@ class AgentLoopState:
     rounds: int = 0
     tool_steps: int = 0
     sources: list[dict[str, Any]] = field(default_factory=list)
+    # Issue #60: consecutive rounds where the same tool name failed. Reset
+    # whenever a round has no failures or a different tool fails. Lets the
+    # loop fast-fail instead of burning through the whole round budget when
+    # the model keeps retrying a tool that isn't going to succeed.
+    last_failed_tool: str = ""
+    consecutive_tool_failures: int = 0
 
 
 @dataclass(slots=True)
 class LLMCallResult:
+    """Result of a single LLM call within the agent loop."""
+
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
@@ -161,6 +170,16 @@ class AgentLoop:
         enabled_tools: list[str],
         tool_schemas: list[dict[str, Any]] | None,
     ) -> None:
+        """Initialize the agent loop with its pipeline, context, and tool configuration.
+
+        Args:
+            pipeline: The owning chat pipeline that provides prompts and dispatch.
+            context: The unified context for the current turn.
+            stream: The stream bus for emitting events to the frontend.
+            client: The LLM client used for completion calls.
+            enabled_tools: List of tool names enabled for this turn.
+            tool_schemas: OpenAI-format tool schemas, or ``None`` to disable tools.
+        """
         self.pipeline = pipeline
         self.context = context
         self.stream = stream
@@ -170,6 +189,7 @@ class AgentLoop:
         self._last_request: LLMRequestSnapshot | None = None
 
     async def run(self) -> None:
+        """Run the full agent loop for one chat turn and emit the result."""
         state = AgentLoopState()
         # Optional async pre-pass briefings (e.g. explore_context) run BEFORE
         # the answer stage so they form their own preceding activity group and
@@ -325,6 +345,30 @@ class AgentLoop:
             state.sources.extend(dispatch.sources)
             messages.extend(dispatch.tool_messages)
 
+            # Issue #60: fast-fail on repeated failures of the same tool,
+            # instead of silently burning through the whole round budget
+            # (observed: a broken RAG grant made every round re-attempt
+            # `rag`, taking 2+ minutes before the budget ran out — and if
+            # the user gave up and stopped the turn before that, nothing
+            # was ever shown). Two consecutive failures of the same tool
+            # is enough signal that retrying isn't going to help.
+            if len(dispatch.failed_tool_names) == 1:
+                failed_name = dispatch.failed_tool_names[0]
+                if failed_name == state.last_failed_tool:
+                    state.consecutive_tool_failures += 1
+                else:
+                    state.last_failed_tool = failed_name
+                    state.consecutive_tool_failures = 1
+            else:
+                state.last_failed_tool = ""
+                state.consecutive_tool_failures = 0
+            if (
+                state.consecutive_tool_failures >= 2
+                and not dispatch.pause
+                and not dispatch.terminate
+            ):
+                return await self._forced_finish(messages, state, reason="tool_failure")
+
             if dispatch.pause:
                 resumed = await self.pipeline._await_user_reply_and_resolve(
                     context=self.context,
@@ -387,6 +431,14 @@ class AgentLoop:
             notice = self.pipeline._t(
                 "notices.loop_error_finish",
                 default="A step failed; answering with what has been gathered.",
+            )
+        elif reason == "tool_failure":
+            notice = self.pipeline._t(
+                "notices.loop_tool_failure_finish",
+                default=(
+                    "A tool kept failing on retry; answering with what has "
+                    "been gathered instead of continuing to retry it."
+                ),
             )
         else:
             notice = self.pipeline._t(

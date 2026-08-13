@@ -167,3 +167,87 @@ feature/*   →   development   →   staging   →   main
 `development`, not `main` (`git checkout -b feature/<name> development`).
 Never push directly to `main` — merge into `staging` first, then open a
 PR from `staging` into `main`.
+
+## Pre-Commit Review Gate
+
+**Every commit must be reviewed before it's made — no exceptions, including
+"trivial" changes.** This was formalized after a session where an ~97-commit,
+207-file `staging` branch had accumulated with no consistent review process,
+making a proper review nearly impossible without splitting it across many
+separate passes.
+
+- **Review the diff you are about to commit, not a batch of unrelated
+  changes.** Keep commits small and scoped to one change; a large commit is
+  a sign work should have been split, not a review to defer. Batching many
+  fixes into one commit specifically to reduce how often you have to review
+  is against the spirit of this rule.
+- **Depth is proportional to size and risk**, not a fixed ceremony:
+  - A one-line config/copy fix: read the diff yourself, confirm it does what
+    it says, move on.
+  - Anything touching business logic, auth, money/grades, or data
+    deletion/migration: re-read the full diff line by line, check every
+    caller of anything you changed (not just the lines the diff shows), and
+    verify live against the running app — not just "the code looks right."
+  - When in doubt, use the `code-review` skill rather than a purely manual
+    read.
+- **"Tests pass" is not sufficient on its own** for anything touching
+  multi-user/course logic — this codebase's real bugs have consistently
+  been integration-level, caught by live testing against the running
+  Docker stack, not unit tests. If Docker is up, use it.
+- **Log what you verified, not just what you changed.** Follow
+  `devin-handoff/DEVIN_LOG.md`'s own entry format (Item / Status / What
+  changed / **Verified** / New findings / Left for later) — the `Verified`
+  line should say *how* you confirmed the change actually works, not just
+  restate the diff.
+- This applies to every agent working in this repo (Claude, Devin, or
+  anyone else) and to every branch, not just `main`-bound work.
+
+## Documentation Conventions
+
+### Python (Google-style docstrings)
+
+All public functions, classes, and methods should have Google-style
+docstrings, enforced via Ruff `D` rules (pydocstyle). The convention
+is set in `pyproject.toml` under `[tool.ruff.lint.pydocstyle]`.
+
+```python
+def example(param: str, optional: int = 0) -> bool:
+    """Short one-line summary.
+
+    Longer description if needed.
+
+    Args:
+        param: Description of the parameter.
+        optional: Optional parameter with default.
+
+    Returns:
+        Description of return value.
+
+    Raises:
+        ValueError: When param is empty.
+    """
+```
+
+Rules relaxed globally during the documentation migration (issues
+#12-#18); per-package enforcement is enabled as each package is
+documented.
+
+### TypeScript / React (TSDoc)
+
+Exported functions, classes, and components should have TSDoc
+comments, enforced via `eslint-plugin-jsdoc` (warnings during
+migration). Format: `/** ... */` with `@param name - description`
+(hyphen required).
+
+```typescript
+/**
+ * Short description.
+ *
+ * @param name - Description of the parameter.
+ * @returns Description of the return value.
+ */
+export function example(name: string): boolean { ... }
+```
+
+Skip: barrel `index.ts`, test files, thin wrappers (<=5 lines),
+unexported helpers.

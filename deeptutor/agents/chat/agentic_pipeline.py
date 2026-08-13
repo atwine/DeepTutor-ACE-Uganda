@@ -193,6 +193,14 @@ class AgenticChatPipeline:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
+        """Initialize the agentic chat pipeline with LLM and chat configuration.
+
+        Args:
+            language: Language code (``"zh"`` or ``"en"``).
+            max_rounds: Optional override for the maximum loop rounds.
+            temperature: Optional override for the sampling temperature.
+            max_tokens: Optional override for the maximum response tokens.
+        """
         self.language = "zh" if language.lower().startswith("zh") else "en"
         self.llm_config = get_llm_config()
         self.binding = getattr(self.llm_config, "binding", None) or "openai"
@@ -269,6 +277,7 @@ class AgenticChatPipeline:
 
     @property
     def usage(self) -> UsageTracker:
+        """Usage tracker recording token costs for this pipeline."""
         return self._usage
 
     @property
@@ -287,6 +296,7 @@ class AgenticChatPipeline:
 
     @property
     def max_rounds(self) -> int:
+        """Maximum number of tool-calling rounds per turn (at least 1)."""
         return max(1, self._max_rounds)
 
     def effective_max_rounds(self, context: UnifiedContext) -> int:
@@ -306,10 +316,12 @@ class AgenticChatPipeline:
 
     @property
     def exploring_max_tokens(self) -> int:
+        """Maximum tokens for exploring-stage LLM calls (at least 128)."""
         return max(128, self._exploring_max_tokens)
 
     @property
     def respond_max_tokens(self) -> int:
+        """Maximum tokens for responding-stage LLM calls (at least 256)."""
         return max(256, self._respond_max_tokens)
 
     @property
@@ -324,6 +336,12 @@ class AgenticChatPipeline:
         return self.respond_max_tokens
 
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+        """Execute the agentic chat pipeline for one turn.
+
+        Args:
+            context: The unified context for the current turn.
+            stream: The stream bus for emitting events to the frontend.
+        """
         await self._prepare_deferred_tools(context)
         await self._prepare_kb_manifests(context)
         self._exec_enabled = await self._exec_allowed(context)
@@ -580,11 +598,36 @@ class AgenticChatPipeline:
 
             level = await get_sandbox_service().isolation_level()
             if level is IsolationLevel.SYSTEM:
-                # Admin can switch exec off per user (grant v2). ``None``
-                # follows the policy: SYSTEM isolation serves everyone.
                 from deeptutor.multi_user.tool_access import exec_override
 
-                return exec_override() is not False
+                # Admin can switch exec on/off per user (grant v2) -- an
+                # explicit override always wins, in either direction.
+                override = exec_override()
+                if override is not None:
+                    return override
+                # Issue #7: with no override set, exec used to default to
+                # "on for everyone". SYSTEM isolation's sandbox-runner
+                # sidecar shares one filesystem view across every account's
+                # exec calls (the per-user volume mount is a whole user
+                # root, not scoped to the requesting account -- see
+                # docker-compose.yml's own scope note on that service) --
+                # so a non-admin's exec could read another student's chat
+                # history, knowledge bases, or settings. Until real
+                # per-student isolation is built, default OFF for
+                # non-admins; an admin can still opt a specific student
+                # back in via the same exec_override grant. Partner turns
+                # run under the admin owner's authority regardless of the
+                # synthetic "user" role, so they're unaffected.
+                if is_partner:
+                    return True
+                try:
+                    from deeptutor.multi_user.context import get_current_user
+
+                    return bool(get_current_user().is_admin)
+                except Exception:
+                    # Single-user local runtime: no other account's data
+                    # exists for a non-admin's exec to cross into.
+                    return True
             if level is IsolationLevel.APPLICATION:
                 if is_partner:
                     return True

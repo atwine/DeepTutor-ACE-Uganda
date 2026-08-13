@@ -16,6 +16,7 @@ import {
 import { GrantEditor } from "@/features/multi-user/components/GrantEditor";
 import { UserAvatar } from "@/components/UserAvatar";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import Pagination from "@/components/common/Pagination";
 import { filterUsersByQuery } from "@/lib/admin-users";
 import {
   Search,
@@ -49,7 +50,7 @@ function formatDate(iso: string, lang: Language): string {
 function roleLabel(role: UserRole, t: (key: string) => string): string {
   if (role === "admin") return t("Admin");
   if (role === "instructor") return t("Instructor");
-  return t("User");
+  return t("Student");
 }
 
 function roleBadgeClass(role: UserRole): string {
@@ -81,6 +82,8 @@ export default function AdminUsersPage() {
   const [createPassword, setCreatePassword] = useState("");
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [createError, setCreateError] = useState("");
+  const [pageOffset, setPageOffset] = useState(0);
+  const USERS_PAGE_LIMIT = 50;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -219,6 +222,24 @@ export default function AdminUsersPage() {
 
   const normalizedQuery = query.trim().toLowerCase();
   const filteredUsers = filterUsersByQuery(users, query);
+  // Issue #42: Client-side pagination over the filtered user list.
+  const pagedUsers = filteredUsers.slice(pageOffset, pageOffset + USERS_PAGE_LIMIT);
+
+  // Issue #76: if the list shrinks (e.g. deleting the last user on the
+  // current page) and pageOffset now points past the end, the slice above
+  // renders empty while the pager still claims a later page -- step back
+  // to the last page that actually has rows.
+  useEffect(() => {
+    if (filteredUsers.length === 0) {
+      if (pageOffset !== 0) setPageOffset(0);
+      return;
+    }
+    if (pageOffset >= filteredUsers.length) {
+      const lastPageOffset =
+        Math.floor((filteredUsers.length - 1) / USERS_PAGE_LIMIT) * USERS_PAGE_LIMIT;
+      setPageOffset(lastPageOffset);
+    }
+  }, [filteredUsers.length, pageOffset]);
 
   return (
     <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
@@ -301,7 +322,10 @@ export default function AdminUsersPage() {
               <input
                 type="search"
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  setPageOffset(0);
+                }}
                 placeholder={t("Search users…")}
                 aria-label={t("Search users")}
                 className="w-full rounded-lg border border-[var(--border)] bg-[var(--card)] py-2 pl-9 pr-3 text-sm
@@ -398,7 +422,7 @@ export default function AdminUsersPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--border)]">
-                {filteredUsers.map((user) => {
+                {pagedUsers.map((user) => {
                   const isSelf = user.username === currentUser;
                   const isAdmin = user.role === "admin";
                   const canManageAssignments = !isAdmin && Boolean(user.id);
@@ -488,7 +512,7 @@ export default function AdminUsersPage() {
                                        text-[var(--foreground)] outline-none focus:border-[var(--ring)]
                                        disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                             >
-                              <option value="user">{t("User")}</option>
+                              <option value="user">{t("Student")}</option>
                               <option value="instructor">
                                 {t("Instructor")}
                               </option>
@@ -544,6 +568,13 @@ export default function AdminUsersPage() {
               </tbody>
             </table>
           )}
+          <Pagination
+            total={filteredUsers.length}
+            limit={USERS_PAGE_LIMIT}
+            offset={pageOffset}
+            disabled={loading}
+            onPageChange={(newOffset) => setPageOffset(newOffset)}
+          />
         </div>
 
         <p className="mt-8 text-center text-xs text-[var(--muted-foreground)]">
