@@ -78,6 +78,7 @@ from .paths import get_admin_path_service
 from deeptutor.services.db import session_scope
 from deeptutor.services.db.models import (
     Assignment,
+    CourseMaterial,
     CourseUnit,
     Enrollment,
     Submission,
@@ -1036,6 +1037,61 @@ async def _run_material_indexing(
         await update_ingestion_status(material_id, "failed")
 
 
+async def _run_material_reindex(kb_name: str, course_unit_id: str) -> None:
+    """Background task: rebuild a course KB's index from its surviving raw
+    files after deleting a material that was already indexed (issue #87).
+
+    ``RAGService.initialize`` is the same "build the index" entry point
+    ``_run_material_indexing`` already uses for a course KB's very first
+    material — for the llamaindex pipeline this is an explicit rebuild
+    operation (``resolve_storage_dir_for_rebuild`` writes to a fresh
+    version dir and only swaps it in on success), so a failed rebuild here
+    leaves the previous, still-correct-but-stale index in place rather than
+    corrupting it.
+
+    If no RAG-supported materials remain, the stale index is left as-is
+    (rebuilding "no documents" isn't a supported operation for every
+    pipeline) — the deleted material's content would still be technically
+    retrievable in that edge case. Logged clearly so it's visible rather
+    than silently wrong; left for a follow-up rather than guessing at each
+    pipeline's empty-KB behavior.
+    """
+    try:
+        # list_materials_for_course's dicts don't carry file_path (it's an
+        # on-disk detail, not part of the API response shape) -- query the
+        # ORM rows directly for it instead.
+        async with session_scope() as session:
+            result = await session.execute(
+                select(CourseMaterial).where(
+                    CourseMaterial.course_unit_id == course_unit_id
+                )
+            )
+            materials = result.scalars().all()
+        raw_dir = _course_kb_raw_dir(kb_name)
+        file_paths = [
+            str(raw_dir / m.file_path)
+            for m in materials
+            if _is_rag_supported(m.filename) and (raw_dir / m.file_path).exists()
+        ]
+        if not file_paths:
+            logger.warning(
+                "Course KB %s has no remaining RAG-supported materials after a "
+                "delete -- the old index was left in place and may still "
+                "surface the deleted material's content.",
+                kb_name,
+            )
+            return
+        from deeptutor.services.rag.service import RAGService
+
+        base_dir = admin_kb_base_dir().resolve()
+        rag_service = RAGService(kb_base_dir=str(base_dir))
+        success = await rag_service.initialize(kb_name=kb_name, file_paths=file_paths)
+        if not success:
+            logger.warning("Reindex after material delete failed for KB %s", kb_name)
+    except Exception as exc:
+        logger.warning("Reindex after material delete failed for KB %s: %s", kb_name, exc)
+
+
 @router.post("/admin/course-units/{course_unit_id}/materials/upload")
 async def upload_course_materials(
     course_unit_id: str,
@@ -1195,23 +1251,41 @@ async def unpublish_course_material(
 async def delete_course_material(
     course_unit_id: str,
     material_id: str,
+    background_tasks: BackgroundTasks,
     current: TokenPayload = Depends(require_instructor_or_admin),
 ) -> dict[str, Any]:
     """Delete a course material -- removes the physical file from the KB's raw/
-    directory and the DB record. Permission: instructor_or_admin (must be an
-    instructor of this unit). Returns 204 No Content."""
+    directory and the DB record, and (issue #87) triggers a background reindex
+    of the KB from its surviving materials if the deleted one was already
+    indexed, so it stops being retrievable via the chat rag tool. Permission:
+    instructor_or_admin (must be an instructor of this unit). Returns 204 No
+    Content."""
     await _require_course_unit_access(current, course_unit_id)
     material = await get_material_orm(course_unit_id, material_id)
     if material is None:
         raise HTTPException(status_code=404, detail="Material not found")
-    # Remove the physical file from the KB's raw/ directory (best-effort).
+    # Whether a reindex is needed comes from the material's own
+    # ingestion_status, not remove_raw_document's was_indexed flag: course
+    # KBs are built via RAGService.initialize() on first upload, which never
+    # populates metadata.json's file_hashes (only the incremental
+    # DocumentAdder path does) -- was_indexed would silently read False for
+    # every course material ever indexed through that first-upload path,
+    # which is the common case. ingestion_status=="ready" is tracked on
+    # every material regardless of which indexing path built it.
+    was_indexed = material.ingestion_status == "ready"
+    # Remove the physical file from the KB's raw/ directory and its indexed-hash
+    # record if one exists (the same helper the personal-KB single-file delete
+    # uses -- a no-op on the hash side for course KBs per the above, but still
+    # the right way to delete the raw file) -- best-effort, same as before.
     kb_name = await get_course_kb_name(course_unit_id)
     if kb_name:
         try:
+            from deeptutor.knowledge.add_documents import remove_raw_document
+
             raw_dir = _course_kb_raw_dir(kb_name)
             file_path = raw_dir / material.file_path
-            if file_path.exists():
-                file_path.unlink()
+            kb_dir = admin_kb_base_dir().resolve() / kb_name
+            remove_raw_document(kb_dir, file_path)
         except Exception as exc:
             logger.warning(
                 "Failed to remove material file %s: %s", material.file_path, exc
@@ -1219,6 +1293,10 @@ async def delete_course_material(
     removed = await delete_material(course_unit_id, material_id)
     if not removed:
         raise HTTPException(status_code=404, detail="Material not found")
+    if kb_name and was_indexed:
+        background_tasks.add_task(
+            _run_material_reindex, kb_name=kb_name, course_unit_id=course_unit_id
+        )
     log_admin_action(
         "course_material_delete",
         summary={"course_unit_id": course_unit_id, "material_id": material_id},
