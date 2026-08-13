@@ -21,6 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from deeptutor.services.db import session_scope
@@ -940,7 +941,7 @@ async def check_and_mark_completion_batch(
 # ---------------------------------------------------------------------------
 
 
-async def delete_user_data(user_id: str) -> None:
+async def delete_user_data(session: AsyncSession, user_id: str) -> None:
     """Explicitly delete a user's Enrollment and Submission rows, as a
     deliberate step of deleting their account.
 
@@ -953,16 +954,19 @@ async def delete_user_data(user_id: str) -> None:
     be deleted at all; the database will refuse the account deletion
     otherwise. This function is that explicit, deliberate step.
 
-    Called from ``identity.py:delete_user()`` — and MUST run before that
-    function deletes the ``User`` row, not after (see its docstring).
+    Takes the caller's own ``session`` (issue #81) rather than opening its
+    own ``session_scope()``: this sweep and the ``User`` row delete in
+    ``identity.py:delete_user()`` must commit or roll back together — a
+    process crash between two separate transactions used to be able to
+    leave a user's enrollments/submissions gone but the account itself
+    still present.
     """
-    async with session_scope() as session:
-        await session.execute(
-            delete(Enrollment).where(Enrollment.user_id == str(user_id))
-        )
-        await session.execute(
-            delete(Submission).where(Submission.user_id == str(user_id))
-        )
+    await session.execute(
+        delete(Enrollment).where(Enrollment.user_id == str(user_id))
+    )
+    await session.execute(
+        delete(Submission).where(Submission.user_id == str(user_id))
+    )
 
 # ---------------------------------------------------------------------------
 # Issue #3: Course materials (instructor uploads + course-specific RAG)

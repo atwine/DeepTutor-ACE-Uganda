@@ -262,7 +262,7 @@ async def get_users_by_ids(user_ids: list[str]) -> dict[str, tuple[str, dict[str
 
 
 async def delete_user(username: str) -> bool:
-    """Delete a user AND sweep their other Postgres rows.
+    """Delete a user AND sweep their other Postgres rows, atomically.
 
     ``course_units.delete_user_data()`` explicitly deletes a user's
     ``Enrollment``/``Submission`` rows. This MUST run before the ``User``
@@ -270,13 +270,19 @@ async def delete_user(username: str) -> bool:
     real ``ON DELETE RESTRICT`` foreign key (grade history is deliberately
     not allowed to cascade-delete — see that column's comment in
     ``models.py``), so deleting the account first would fail outright with
-    submissions still attached. Sweeping first, then deleting the account,
-    means this intended path always succeeds while any *other*, unreviewed
-    path that tries to delete a user out from under existing submissions
-    gets stopped by the database instead of silently destroying grades.
+    submissions still attached.
+
+    Issue #81: the sweep and the account delete used to run as two (three,
+    counting the initial lookup) separate ``session_scope()`` transactions.
+    A crash or restart between them could leave a user's
+    enrollments/submissions gone but the ``User`` row still present — a
+    partially-deleted account. Everything now runs inside one transaction,
+    so it either all commits or all rolls back.
     """
     from deeptutor.services.db.engine import session_scope
     from deeptutor.services.db.models import User
+
+    from .course_units import delete_user_data
 
     async with session_scope() as session:
         row = (
@@ -284,13 +290,7 @@ async def delete_user(username: str) -> bool:
         ).scalar_one_or_none()
         if row is None:
             return False
-        user_id = row.id
-
-    from .course_units import delete_user_data
-
-    await delete_user_data(user_id)
-
-    async with session_scope() as session:
+        await delete_user_data(session, row.id)
         await session.execute(delete(User).where(User.username == username))
     return True
 
