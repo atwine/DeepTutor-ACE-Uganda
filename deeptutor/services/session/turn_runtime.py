@@ -1745,6 +1745,17 @@ class TurnRuntimeManager:
                 )
             with contextlib.suppress(Exception):
                 await self._flush_buffered_events(execution)
+            # Issue #91: a step still mid-flight when the cancellation lands
+            # (e.g. "Exploring...") has its trace event saved with
+            # call_state="running" — nothing else ever closes it out, so
+            # reopening this conversation later would show that step frozen
+            # mid-spin forever, even though the turn itself is correctly
+            # marked cancelled below. Close out any still-open call state
+            # before persisting.
+            for event in assistant_events:
+                metadata = event.get("metadata")
+                if isinstance(metadata, dict) and metadata.get("call_state") == "running":
+                    metadata["call_state"] = "cancelled"
             # Best-effort: persist what the turn already produced (streamed
             # answer text, trace events, generated files) so cancelling a
             # turn does not erase visible work — files the model created are
