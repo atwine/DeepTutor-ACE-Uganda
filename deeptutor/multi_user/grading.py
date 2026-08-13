@@ -110,7 +110,9 @@ async def grade_submission(
 
     for question in assignment.get("questions", []):
         qid = question.get("question_id", "")
-        points = float(question.get("points") or 1.0)
+        # Issue #65: same `0 or 1.0` fix as assignments.py's _normalize_question
+        # -- an explicit `points: 0` question was silently regraded worth 1.
+        points = float(question["points"]) if question.get("points") is not None else 1.0
         user_answer = answers_by_question.get(qid, "")
         question_type = question.get("question_type", "")
         total_max += points

@@ -61,7 +61,11 @@ def _normalize_question(q: dict[str, Any]) -> dict[str, Any]:
         "options": q.get("options") if isinstance(q.get("options"), dict) else None,
         "correct_answer": str(q.get("correct_answer") or ""),
         "explanation": str(q.get("explanation") or ""),
-        "points": float(q.get("points") or 1.0),
+        # Issue #65: `q.get("points") or 1.0` silently overrode an explicit
+        # `points: 0` (e.g. an ungraded practice question) to 1, since
+        # `0 or 1.0` evaluates to `1.0` in Python. Distinguish "not
+        # provided" from "explicitly 0".
+        "points": float(q["points"]) if q.get("points") is not None else 1.0,
     }
 
 
