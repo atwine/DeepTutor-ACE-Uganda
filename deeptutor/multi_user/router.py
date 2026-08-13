@@ -736,14 +736,16 @@ async def course_unit_roster_endpoint(
 @router.get("/course-units/{course_unit_id}/requests")
 async def course_unit_requests_endpoint(
     course_unit_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current: TokenPayload = Depends(require_instructor_or_admin),
 ) -> dict[str, Any]:
     """Pending enrollment requests awaiting this course unit's instructor(s)."""
     await _require_course_unit_access(current, course_unit_id)
-    enrollments = [
-        e for e in await list_enrollments_for_course(course_unit_id)
-        if e.get("status", "approved") == "pending"
-    ]
+    enrollments = await list_enrollments_for_course(
+        course_unit_id, status="pending", limit=limit, offset=offset
+    )
+    total = await count_enrollments_for_course(course_unit_id, status="pending")
     # Issue #37: batch user lookup — one file read instead of N.
     user_records = await get_users_by_ids([e["user_id"] for e in enrollments])
     requests = [
@@ -751,7 +753,7 @@ async def course_unit_requests_endpoint(
         for enrollment in enrollments
         if (info := await _enrollment_with_student_info(enrollment, user_records)) is not None
     ]
-    return {"requests": requests}
+    return {"requests": requests, "total": total, "limit": limit, "offset": offset}
 
 
 @router.post("/course-units/{course_unit_id}/requests/{user_id}/approve")
