@@ -42,7 +42,12 @@ from .assignments import (
     update_assignment,
     upsert_access_grant,
 )
-from .course_units import get_course_unit, is_approved_student_of, is_instructor_of
+from .course_units import (
+    check_and_mark_completion,
+    get_course_unit,
+    is_approved_student_of,
+    is_instructor_of,
+)
 from .grading import grade_submission
 from .gradebook import build_gradebook, build_gradebook_csv
 from .identity import get_user_by_id, get_users_by_ids
@@ -395,6 +400,15 @@ async def submit_assignment_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Issue #82: this used to only get re-evaluated as a side effect of the
+    # student later visiting the course catalog (course_unit_catalog_endpoint)
+    # or the gradebook being rebuilt — meaning completion could sit stale
+    # indefinitely right after the exact moment it should have flipped. Cheap
+    # (a handful of indexed queries, no LLM call) — safe to do inline here
+    # rather than deferring to a background task.
+    await check_and_mark_completion(assignment["course_unit_id"], user_id)
+
     return {"submission": record}
 
 
