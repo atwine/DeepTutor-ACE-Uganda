@@ -323,24 +323,20 @@ def _resolve_soul_content(soul: SoulSpec | None) -> tuple[str, dict[str, str]]:
 
 
 def _load_persona_markdown(name: str) -> str:
-    from deeptutor.multi_user.context import get_current_user
-    from deeptutor.multi_user.paths import get_admin_path_service
-    from deeptutor.services.persona import PersonaService, get_persona_service
+    # Issue #90: this used to fall back to reading the admin's own persona
+    # workspace when the caller wasn't an admin -- but `partners.router` is
+    # mounted admin-only (`Depends(require_admin)` in api/main.py), so the
+    # caller here is always the admin already, and get_persona_service()
+    # already resolves *their* workspace. The fallback branch could never
+    # run and read from the exact same place the primary path already
+    # does, so it was pure dead code, not a real broader-access path.
+    from deeptutor.services.persona import get_persona_service
 
     try:
         detail = get_persona_service().get_detail(name)
         return strip_frontmatter(detail.content)
     except Exception:
-        pass
-    try:
-        if not get_current_user().is_admin:
-            admin_service = PersonaService(
-                root=get_admin_path_service().get_workspace_dir() / "personas"
-            )
-            return strip_frontmatter(admin_service.get_detail(name).content)
-    except Exception:
-        pass
-    return ""
+        return ""
 
 
 # ── Soul template library (before /{partner_id} routes) ───────
@@ -435,8 +431,11 @@ async def delete_soul(soul_id: str):
 @router.get("/soul-sources")
 async def soul_sources():
     """Everything the create-wizard's soul step can start from."""
-    from deeptutor.multi_user.context import get_current_user
-    from deeptutor.multi_user.paths import get_admin_path_service
+    # Issue #90: same dead-code removal as _load_persona_markdown above --
+    # `partners.router` is admin-only, so the caller is always the admin
+    # already, and get_persona_service() already lists their own personas.
+    # The "admin fallback" branch listed the exact same workspace a second
+    # time and could never actually run.
     from deeptutor.services.persona import PersonaService, get_persona_service
 
     def _persona_entry(service: PersonaService, info: Any) -> dict[str, str]:
@@ -449,24 +448,12 @@ async def soul_sources():
         return {"name": info.name, "description": info.description, "content": content}
 
     personas: list[dict[str, str]] = []
-    seen: set[str] = set()
     try:
         service = get_persona_service()
         for info in service.list_personas():
             personas.append(_persona_entry(service, info))
-            seen.add(info.name)
     except Exception:
         logger.warning("Failed to list user personas", exc_info=True)
-    try:
-        if not get_current_user().is_admin:
-            admin_service = PersonaService(
-                root=get_admin_path_service().get_workspace_dir() / "personas"
-            )
-            for info in admin_service.list_personas():
-                if info.name not in seen:
-                    personas.append(_persona_entry(admin_service, info))
-    except Exception:
-        logger.warning("Failed to list admin personas", exc_info=True)
 
     return {"library": get_partner_manager().list_souls(), "personas": personas}
 
