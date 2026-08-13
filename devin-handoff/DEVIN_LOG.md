@@ -5810,3 +5810,65 @@ explicitly said they don't know how to tackle this pre-production, parking
 it), the frontend structural-review gap from Devin's coverage self-audit.
 
 ---
+
+## 2026-08-13 — Claude — Closed #7: turned off code execution for students by default
+
+**Item**: not in TODO.md — repo owner picked #7 off the "what's left" list,
+asked for a plain-language explanation of what it actually meant (hadn't
+touched code execution and didn't remember the original security review),
+then decided: real per-student sandbox isolation is a bigger job than
+warranted right now, and the feature isn't core to what students need —
+so disable it for students rather than build the isolation work under
+time pressure.
+**Status**: fixed, verified live, closed.
+
+**The actual risk** (explained to the repo owner in plain terms first):
+`sandbox-runner`'s SYSTEM-isolation mode (the one active in this stack —
+`DEEPTUTOR_SANDBOX_RUNNER_URL` is set) mounts the *entire* `data/users`
+directory into one shared container filesystem for every account's
+`code_execution`/`exec` calls, not scoped per request
+(`docker-compose.yml`'s own scope-note comment already documented this as
+a known, accepted risk). A student's sandboxed code could, in principle,
+read another student's `chat_history.db`, knowledge bases, or settings.
+Confirmed via `AGENTS.md`'s own tool-mount description that `exec`/
+`code_execution` are auto-mounted (context-gated, not role-gated) — this
+is live today for every account, not a future risk waiting on a feature
+launch.
+
+**Fix**: `_exec_allowed` in `deeptutor/agents/chat/agentic_pipeline.py`
+already had a per-user override (`exec_override`, grant v2) letting an
+admin switch exec OFF for one student — what was missing was the
+*default* with no override set, which was "on for everyone"
+(`exec_override() is not False`). Flipped the default to
+`get_current_user().is_admin`, mirroring the exact pattern the weaker
+APPLICATION-isolation branch two lines below already used. Net effect:
+admins unchanged, non-admins denied by default, admin can still opt an
+individual student back in via the same override — nothing about the
+override mechanism itself changed. Also updated `docker-compose.yml`'s
+scope-note comment to say the cross-user mount is now *dormant* for the
+accounts that would trip over it, not fixed at the infrastructure level.
+
+**Tradeoff surfaced to the repo owner, not silently absorbed**: the
+office-document generation skills (docx/pdf/pptx/xlsx) route through
+`code_execution` per `runtime_settings.py`'s own comment — students lose
+access to those too until this is revisited, not just arbitrary "run
+code" requests.
+
+**Verified live** against the rebuilt image, three scenarios via a real
+`AgenticChatPipeline._exec_allowed()` call (not a full chat turn, since
+that needs a working LLM and the local vLLM endpoint has been
+intermittently unreachable from this container all session): (1) a
+simulated non-admin student with no override → `False`; (2) a simulated
+admin with no override → `True`, confirming admins are unaffected; (3) a
+real seeded student (`christine.apio`) with an explicit
+`exec_enabled: True` grant set → `True`, confirming the admin escape
+hatch still works. Cleaned up the test grant afterward.
+**New findings**: none.
+**Left for later / handing back**: the underlying cross-user filesystem
+mount in `docker-compose.yml` is unchanged — this makes the risk dormant,
+not fixed at the infrastructure level. Revisit before re-enabling exec
+broadly for students (per-command isolation or per-session temp mounts,
+per the original issue's own framing). Rest of the backlog from the
+entry above is unchanged.
+
+---
