@@ -1697,6 +1697,25 @@ async def _compute_insights(term: str) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/health-check")
+async def admin_health_check(
+    _: TokenPayload = Depends(require_admin),
+) -> dict[str, Any]:
+    """Issue #79: on-demand data-integrity check -- enrollments marked
+    complete without the submissions to back it up, courses with no
+    instructor, assignments that can never be passed. A second line of
+    defense alongside the FK hardening (issue #66) and the #63/#64/#65
+    correctness fixes; catches anything that slipped through before those
+    landed. Same checks as ``scripts/data_integrity_check.py`` (for
+    running on a schedule outside the app), exposed here so an admin can
+    check without shell access.
+    """
+    from .health_check import run_all_checks
+
+    findings = await run_all_checks()
+    return {"findings": findings, "count": len(findings)}
+
+
 @router.get("/admin/insights")
 async def admin_insights(
     term: str = Query("", description="Filter to a single CourseUnit.term; empty = all terms"),
