@@ -5721,3 +5721,92 @@ and fixed within this same entry.
 backlog from the entry above is unchanged.
 
 ---
+
+## 2026-08-13 — Claude — Reopened 4 partially-fixed issues, confirmed Jupyter notebooks work end-to-end, fixed #86, shipped #79
+
+**Item**: not in TODO.md — resuming the "left for later" list from a few
+entries above. Repo owner asked me to explain the "reopen #61/#35/#42/#58"
+note (from the two-axis review of `main...HEAD` earlier in this log) in
+plain language, decided to reopen and re-scope all 4, then asked me to
+confirm Jupyter notebook upload/rendering/RAG behavior and move on to
+#79 and #86 (deferring #78/backups until deployment target is decided).
+**Status**: all reopened/re-scoped, notebook behavior confirmed + one stale
+doc comment fixed, #86 and #79 both implemented and closed.
+
+**Reopened and re-scoped #61/#35/#42/#58** to just their remaining gaps
+(each comment quotes the exact missing piece from the two-axis review
+above): #61 → blank `term` still accepted; #35 → "Change role" action
+never landed; #42 → 6 of 9 components still unpaginated
+(StudentDashboard.tsx, gradebook/page.tsx, ChatMessages.tsx,
+ChatHistorySection.tsx, courses/page.tsx, BookLibrary.tsx); #58 →
+`deep_dive`/`section` block types still can't be hand-edited. No code
+changed — deliberately left for a future session, not started here.
+
+**Jupyter notebook confirmation** (repo owner asked directly whether
+notebooks render and feed RAG, since they hadn't tried uploading one
+yet): verified live rather than just reading code.
+- Rendering: read-only, no code execution. Markdown cells render via
+  `ReactMarkdown`, code cells via `SyntaxHighlighter`, stream/error
+  outputs render as text. Image/plot outputs are explicitly a "v1: skip"
+  placeholder in `NotebookViewer.tsx` — not rendered yet.
+- RAG: uploaded a real `.ipynb`, watched `ingestion_status` reach
+  `"ready"`, then called `RAGService.search()` directly for content that
+  only existed in that notebook's code-cell output — found it.
+- **Found and fixed a real doc bug while confirming this**: three
+  comments in `deeptutor/multi_user/router.py`
+  (`_is_rag_supported`/`_run_material_indexing`/`upload_course_materials`)
+  explicitly claimed `.ipynb` files are *not* RAG-indexed — stale, from
+  before `notebook_parser` support was added, never updated. No behavior
+  was wrong, only the comments; corrected them (commit `c16b6a80`) before
+  they misled anyone else the way they almost misled this answer.
+
+**#86 — course-material upload had no file-type/MIME validation.**
+`upload_course_materials` only stripped path components — no extension
+allowlist at all, meaning `.html` (served back with a guessed
+`text/html` Content-Type — real XSS vector) or any other file type could
+be uploaded. Now calls `DocumentValidator.validate_upload_safety()` (the
+same helper the Knowledge Center upload path already uses) scoped to
+exactly `_COURSE_MATERIAL_FILE_TYPES`'s extensions via the
+`allowed_extensions` override — deliberately *not* the validator's own
+broader default list, which is missing `.ipynb` entirely and includes
+`.html`. Passing a custom extension set also intentionally skips the
+default MIME check, matching the Knowledge Center path's own established
+pattern (`mimetypes.guess_type` doesn't know `.ipynb`/`.md` and would
+reject valid uploads if forced through the default MIME allowlist).
+Commit `0da93d0b`. **Verified live**: `.html` and `.sh` uploads now 400;
+`.md`/`.ipynb` uploads still succeed; path-traversal/null-byte filenames
+confirmed sanitized via the validator directly.
+
+**#79 — new data-integrity health check.** FK constraints (issue #66)
+catch dangling references, not internally-inconsistent rows (an
+enrollment marked complete that its submissions don't actually support,
+a course with no instructor, an assignment that can never be passed).
+New `deeptutor/multi_user/health_check.py` with 3 checks
+(`check_stale_completions`, `check_courses_without_instructors`,
+`check_broken_assignments`), exposed as `scripts/data_integrity_check.py`
+(CLI, exits 1 on any finding — safe for cron/CI) and
+`GET /admin/health-check` (for checking without shell access). Commit
+`3b3553da`. **Verified live**: ran against real data first (0 findings —
+also a nice confirmation that #63/#64/#65 left the data consistent),
+then deliberately created one of each broken state (a stale
+`completed_at` via direct SQL, a course with no instructor via the
+normal create-course API, a published assignment with only a 0-point
+question via the normal assignment API) and confirmed all 3 were caught
+by *both* the endpoint and the CLI script, then cleaned up and confirmed
+0 findings again.
+
+**#78 (backups) explicitly not started** — repo owner doesn't yet know
+where this will be deployed in production, and different hosts change
+the right backup approach (self-managed pg_dump + file copy vs. a
+managed database's built-in backups). Explained the tradeoff and agreed
+to revisit once a hosting decision is made, rather than build a specific
+solution now that might not fit.
+
+**New findings**: the stale `.ipynb`/RAG doc-comment bug above.
+**Left for later / handing back**: #61/#35/#42/#58 (reopened, re-scoped,
+not started), #78 (backups — blocked on a hosting decision), #69/#71/#73/#74
+(larger pagination work), #77 (DB connection timeout — repo owner
+explicitly said they don't know how to tackle this pre-production, parking
+it), the frontend structural-review gap from Devin's coverage self-audit.
+
+---
