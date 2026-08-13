@@ -92,17 +92,23 @@ export default function CourseUnitsPage() {
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
 
-  const load = useCallback(async (admin: boolean, offset: number = 0) => {
+  // Issue #72: listUsers() is unbounded (every user) and only exists to
+  // populate the instructor picker in the create/edit form -- it doesn't
+  // need to be refetched on every page-change click, just once up front
+  // and after a save (in case a new instructor account was just created).
+  const load = useCallback(async (admin: boolean, offset: number = 0, includeUsers = true) => {
     setLoading(true);
     setError("");
     try {
       const [paged, userList] = await Promise.all([
         listCourseUnitsPaged(PAGE_LIMIT, offset),
-        admin ? listUsers() : Promise.resolve<UserRecord[]>([]),
+        admin && includeUsers ? listUsers() : Promise.resolve<UserRecord[] | null>(null),
       ]);
       setUnits(paged.items);
       setTotalCount(paged.total);
-      setInstructors(userList.filter((u) => u.role === "instructor"));
+      if (userList !== null) {
+        setInstructors(userList.filter((u) => u.role === "instructor"));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : t("Failed to load course units"));
     } finally {
@@ -203,6 +209,10 @@ export default function CourseUnitsPage() {
         );
       }
       setForm(null);
+      // Issue #75: load(isAdmin) with no offset always reloads page 1 --
+      // reset pageOffset alongside it so the pager control doesn't keep
+      // showing a stale page number for data that's no longer displayed.
+      setPageOffset(0);
       await load(isAdmin);
     } catch (e) {
       setFormError(e instanceof Error ? e.message : t("Failed to save course unit"));
@@ -418,7 +428,12 @@ export default function CourseUnitsPage() {
                 {t("New course unit")}
               </button>
               <button
-                onClick={() => load(isAdmin)}
+                onClick={() => {
+                  // Issue #75: same page-1-reload-but-stale-pager fix as
+                  // the create/update reload above.
+                  setPageOffset(0);
+                  void load(isAdmin);
+                }}
                 disabled={loading}
                 className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm
                            border border-[var(--border)] text-[var(--muted-foreground)]
@@ -512,7 +527,7 @@ export default function CourseUnitsPage() {
               disabled={loading}
               onPageChange={(newOffset) => {
                 setPageOffset(newOffset);
-                void load(isAdmin, newOffset);
+                void load(isAdmin, newOffset, /* includeUsers */ false);
               }}
             />
           </div>

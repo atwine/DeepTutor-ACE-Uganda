@@ -88,6 +88,7 @@ export function StudentDashboard({
   // Action state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [allCourses, setAllCourses] = useState<CourseUnit[]>([]);
+  const [coursesLoadError, setCoursesLoadError] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
   const [confirm, setConfirm] = useState<{
@@ -104,13 +105,17 @@ export function StudentDashboard({
 
   // Load all course units for the enroll dialog
   const loadCourses = useCallback(async () => {
+    setCoursesLoadError("");
     try {
       const units = await listCourseUnits();
       setAllCourses(units);
-    } catch {
-      // silently fail — the enroll dialog will show an empty list
+    } catch (e) {
+      // Issue #72: this used to fail silently, leaving an admin looking at
+      // an empty "Select course…" dropdown with no way to tell that apart
+      // from "no courses exist yet."
+      setCoursesLoadError(e instanceof Error ? e.message : t("Failed to load course list"));
     }
-  }, []);
+  }, [t]);
 
   const filteredStudents = useMemo(() => {
     let result = students;
@@ -375,6 +380,11 @@ export function StudentDashboard({
             </button>
           ) : (
             <div className="flex items-center gap-2">
+              {coursesLoadError && (
+                <span className="text-xs text-red-600 dark:text-red-400">
+                  {coursesLoadError}
+                </span>
+              )}
               <select
                 value={bulkEnrollCourseId}
                 onChange={(e) => setBulkEnrollCourseId(e.target.value)}
@@ -770,6 +780,11 @@ export function StudentDashboard({
             <p className="mb-4 text-sm text-[var(--muted-foreground)]">
               {t("Select a course to enroll {{name}} into:", { name: enrollTarget.username })}
             </p>
+            {coursesLoadError && (
+              <p className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+                {coursesLoadError}
+              </p>
+            )}
             <select
               value={enrollCourseId}
               onChange={(e) => setEnrollCourseId(e.target.value)}

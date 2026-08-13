@@ -1791,6 +1791,7 @@
   "Select {{name}}": "Select {{name}}",
   "Action failed": "Action failed",
   "Failed to enroll": "Failed to enroll",
+  "Failed to load course list": "Failed to load course list",
   "Optional / Bonus": "Optional / Bonus",
   "Optional assignment (doesn't block completion)": "Optional assignment (doesn't block completion)",
   "Students who skip this assignment can still be marked complete for the course.": "Students who skip this assignment can still be marked complete for the course.",
