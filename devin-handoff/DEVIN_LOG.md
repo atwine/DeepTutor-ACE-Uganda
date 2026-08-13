@@ -5510,3 +5510,114 @@ reopen/re-scope #61, #35, #42, #58 the way #60 was, and the frontend
 structural-review gap noted in Devin's coverage self-audit above.
 
 ---
+
+## 2026-08-13 — Claude — Closed #60, 6 quick-win frontend/backend bugs (#67/68/70/72/75/76), the data-correctness group (#62-66), and #90/#91
+
+**Item**: not in TODO.md — continuing the repo owner's punch list: "start on
+#81, #87, #88, #89 next" (covered in the entry directly above), then, per
+direct instruction, the remaining open bugs in priority order the repo owner
+chose live in conversation: quick wins first, then the data-correctness group
+(#62-66), then #90, then #91 (a bug this session filed on itself while
+verifying #60).
+**Status**: all closed. Every issue from the original #80-#90 sweep plus #60
+and #91 is now closed on GitHub.
+
+**#60 (chat hang, re-scoped) — closed, no code change needed.** Both
+remaining asks were already fixed by earlier work, confirmed by direct live
+testing rather than just reading code:
+- Traceback logging: forced a real exception inside `execute_tool_call` and
+  confirmed the full traceback reaches `docker logs` via Python's default
+  stderr handling (no custom logging config overrides it).
+- Cancelled-turn persistence: cancelled a real turn over a live WebSocket
+  connection mid-flight, then inspected the SQLite session store directly —
+  turn status saved as `cancelled` (not stuck `running`), an assistant
+  message row was persisted (not vanished), client got a clear "Turn
+  cancelled" message.
+- Filed **#91** as a residual, low-severity finding from that verification:
+  a step still `running` at the moment of cancellation stayed frozen
+  mid-spin in the saved trace forever.
+
+**6 quick wins, each its own commit, each live-verified in the browser
+and/or via API**:
+- **#67** — `mark_notification_read` now re-checks `is_approved_student_of`
+  before recording a read (`a521cc30`). Verified: 404 for a course a student
+  isn't enrolled in, 200 for their own course.
+- **#68** — bulk disable/delete now use `Promise.allSettled` and report a
+  per-student success/failure count instead of one generic "Action failed"
+  (`67398fcd`). Verified in the browser: bulk-disabled 2 real students.
+- **#70** — sign-out failures are now caught and surfaced instead of
+  vanishing silently (`7632857d`). Verified in the browser.
+- **#72** — course-load errors now surface inline in the enroll dialogs; the
+  course-units page no longer refetches the entire unbounded user list on
+  every pagination click (`6a5a1ebc`). Verified in the browser.
+- **#75** — course-units refresh/save now resets the pager to page 1 instead
+  of leaving it stale (landed in the same commit as #72, same file).
+- **#76** — Users admin page now clamps `pageOffset` back into range when
+  the filtered list shrinks below it (`7f77be29`). Verified via TypeScript
+  compile + code review only — couldn't reproduce the exact 51-user boundary
+  live without seeding far more test accounts than the 24 in the dev
+  database; said so explicitly rather than claiming a live test that didn't
+  happen.
+
+**Data-correctness group (#62-66)**:
+- **#62** — `_sync_course_kb_grant` now retries 3x, and a still-failing
+  *revoke* (not grant) raises instead of silently logging, so a withdrawn
+  student's KB access can't drift out of sync forever (`e43cbd58`). Verified
+  live by monkeypatching `save_grant` to always fail inside the running
+  container, for both directions.
+- **#63** — `admin_reset_submission_attempts` now clears
+  `Enrollment.completed_at` when the reset assignment was required and the
+  student had already been marked complete (`4ccc9210`). Verified live:
+  wiped a real student's Final Exam submission, watched completion drop from
+  1/1 to 0/1, resubmitted, watched it correctly flip back.
+- **#64** — course completion no longer permanently blocks when every
+  published assignment happens to be optional (`ed7a90f9`). Verified live:
+  built a course of one optional-only assignment, submitted it, completion
+  correctly hit 1/1.
+- **#65** — an explicit `points: 0` question is no longer silently coerced
+  to 1 (`0 or 1.0` in Python) — fixed in all three places the pattern
+  appeared: `assignments.py`, `grading.py`, `gradebook.py` (`23ebe737`).
+  Verified live: 0-point question graded 0/0, didn't skew the 5-point
+  assignment's total.
+- **#66** — investigated, found **already fixed** by an unrelated same-day
+  commit (`6525dc40`, "Enforce real foreign keys from every user_id column
+  to the accounts table") that added `ON DELETE CASCADE` FKs from both
+  `assignment_access_grants.user_id` and `notification_reads.user_id` to
+  `users.id` — more robust than the app-level sweep the issue asked for,
+  since it covers every deletion path, not just `delete_user_data()`.
+  Verified live: created a user with a real access grant and a real
+  notification-read row, deleted the user, both vanished via cascade with
+  zero application code involved.
+
+**#90 — decided, not just cleaned up.** Diffed `partners.py` and its router
+mounting in `api/main.py` against `upstream/main` (HKUDS/DeepTutor): both the
+admin-only gate and the dead `is_admin` fallback branches are byte-identical
+to upstream — this file has zero fork-specific changes beyond docstrings.
+No evidence anywhere that non-admins were ever meant to reach these
+endpoints. Removed the dead branches in `_load_persona_markdown` and
+`soul_sources` rather than loosening the gate (`1f5501d6`). Verified live:
+`GET /soul-sources` as admin returns identical content before/after.
+
+**#91 — fixed same session it was filed.** `_run_turn`'s `CancelledError`
+handler now walks `assistant_events` before persisting and flips any
+still-`"running"` `call_state` to `"cancelled"` (`128d17e4`). Verified live:
+cancelled a real turn mid-step, inspected the persisted `events_json`
+directly in SQLite — `call_state` read `"cancelled"`, not `"running"`.
+
+**Verified**: every fix above was checked against the actual rebuilt Docker
+image — either via a real HTTP/WebSocket call against the running backend,
+or (for the two frontend-pagination edge cases, #75/#76) via the browser
+plus TypeScript compilation, with the live-testing gap stated plainly rather
+than glossed over.
+**New findings**: none beyond #91 (filed and fixed this same session) and
+the #87 self-caught bugs already logged in the entry above.
+**Left for later / handing back**: the remaining open backlog is now:
+#69, #71, #73, #74 (larger admin-pagination work, deferred as bigger than
+today's quick-win batch), #77 (no DB connection timeout), **#78 (no backups
+— explicitly flagged to the repo owner as the highest-priority remaining
+gap before any real student data is at stake)**, #79 (no data-integrity
+health check), #86 (upload validation gap), plus the long-standing question
+of whether to reopen/re-scope #61/#35/#42/#58 the way #60 was, and the
+frontend structural-review gap from Devin's coverage self-audit.
+
+---
