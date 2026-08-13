@@ -1934,8 +1934,17 @@ async def admin_reset_submission_attempts(
 
     Admin-only (the admin is the last-resort fixer). Instructors use the
     assignment access grant system for accommodations instead.
+
+    Issue #63: Enrollment.completed_at is additive/idempotent — nothing
+    else in the codebase ever clears it once set. If this assignment is a
+    required one and the student had already completed the course, wiping
+    their submission for it without also clearing completed_at leaves the
+    gradebook/catalog/Insights all reporting them as finished despite now
+    being missing a graded submission for required work.
     """
     from sqlalchemy import delete as sa_delete
+
+    from .assignments import get_assignment
 
     async with session_scope() as session:
         result = await session.execute(
@@ -1951,6 +1960,19 @@ async def admin_reset_submission_attempts(
             status_code=404,
             detail="No submissions found for this student/assignment pair",
         )
+
+    assignment = await get_assignment(assignment_id)
+    if assignment is not None and not assignment.get("is_optional", False):
+        async with session_scope() as session:
+            enroll_result = await session.execute(
+                select(Enrollment).where(
+                    Enrollment.course_unit_id == assignment["course_unit_id"],
+                    Enrollment.user_id == str(user_id),
+                )
+            )
+            enrollment = enroll_result.scalar_one_or_none()
+            if enrollment is not None and enrollment.completed_at is not None:
+                enrollment.completed_at = None
 
     log_admin_action(
         "reset_submission_attempts",
