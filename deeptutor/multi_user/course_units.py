@@ -1160,3 +1160,36 @@ async def update_ingestion_status(
             return
         material.ingestion_status = status
         await session.flush()
+
+
+async def recover_stuck_indexing_materials() -> int:
+    """Startup recovery for materials orphaned mid-index (issue #88).
+
+    ``_run_material_indexing`` sets ``ingestion_status="indexing"`` around
+    the actual indexing work and always updates it to ``ready``/``failed``
+    on the way out -- except that in-memory ``BackgroundTasks`` coroutine
+    cannot survive a process restart, OOM kill, or ungraceful shutdown. Any
+    material still reading ``"indexing"`` when this runs at the *next*
+    startup can only be one that was killed mid-flight during a previous
+    run (a live process never leaves that state set on its own without
+    finishing the try/except that clears it) -- no time threshold is
+    needed to tell "genuinely still indexing" apart from "stuck", since a
+    genuinely-still-indexing task cannot exist yet at the moment this
+    function runs, at the very start of a fresh process.
+
+    Resets to ``"failed"`` rather than back to ``"pending"``: silently
+    re-queuing indexing on every restart could retry the same
+    crash-inducing document forever. ``"failed"`` at least surfaces in the
+    instructor UI and lets them explicitly retry.
+
+    Returns the number of materials recovered.
+    """
+    async with session_scope() as session:
+        result = await session.execute(
+            select(CourseMaterial).where(CourseMaterial.ingestion_status == "indexing")
+        )
+        stuck = result.scalars().all()
+        for material in stuck:
+            material.ingestion_status = "failed"
+        await session.flush()
+    return len(stuck)
