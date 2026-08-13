@@ -7,6 +7,8 @@
 # ============================================
 # Runtime data (knowledge bases, tutorbot workspaces, memory, etc.)
 data/
+# Database/file backups (issue #78) -- contain real user data, never committed.
+backups/
 /multi-user/
 run_code_workspace/
 deeptutor/agents/question/reference_papers/
