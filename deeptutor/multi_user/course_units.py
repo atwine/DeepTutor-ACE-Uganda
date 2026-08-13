@@ -15,6 +15,7 @@ routers only gain ``await``, no logic changes.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
@@ -42,6 +43,10 @@ logger = logging.getLogger(__name__)
 COURSE_END_GRACE_PERIOD_DAYS = 7
 
 
+_SYNC_KB_GRANT_RETRIES = 3
+_SYNC_KB_GRANT_RETRY_DELAY_SECONDS = 0.5
+
+
 async def _sync_course_kb_grant(user_id: str, kb_name: str | None, *, grant_access: bool) -> None:
     """Issue #57: bridge enrollment to course-material RAG access.
 
@@ -55,32 +60,72 @@ async def _sync_course_kb_grant(user_id: str, kb_name: str | None, *, grant_acce
     grants or revokes course access; a no-op if the course has no KB
     provisioned yet, or the user is an admin (admins already see every
     KB and cannot hold a grants file — see ``save_grant``).
+
+    Issue #62: this runs after the enrollment DB transaction has already
+    committed, so a failure here can't be rolled back — but a *revoke*
+    failing silently fails open (a withdrawn student keeps chat access to
+    the course's materials with nothing in the UI hinting anything is
+    wrong), which is worse than a *grant* failing silently (a newly
+    enrolled student just can't retrieve materials yet). Retries a few
+    times for both directions since the underlying write is a plain file
+    write that can hit a transient disk hiccup; only a revoke that's still
+    failing after retries is escalated by raising, so the caller/endpoint
+    surfaces it instead of the access grant quietly drifting out of sync
+    with the enrollment status forever.
     """
     if not kb_name:
         return
-    try:
-        from .grants import load_grant, save_grant
-        from .identity import get_user_by_id
+    last_exc: Exception | None = None
+    for attempt in range(_SYNC_KB_GRANT_RETRIES):
+        try:
+            from .grants import load_grant, save_grant
+            from .identity import get_user_by_id
 
-        record = await get_user_by_id(user_id)
-        if record is None or str(record[1].get("role") or "user") == "admin":
-            return
-        grant = load_grant(user_id)
-        kb_list = grant.setdefault("knowledge_bases", [])
-        existing = [item for item in kb_list if str(item.get("name") or "") == kb_name]
-        if grant_access:
-            if not existing:
-                kb_list.append({"name": kb_name, "resource_id": f"admin:kb:{kb_name}"})
+            record = await get_user_by_id(user_id)
+            if record is None or str(record[1].get("role") or "user") == "admin":
+                return
+            grant = load_grant(user_id)
+            kb_list = grant.setdefault("knowledge_bases", [])
+            existing = [item for item in kb_list if str(item.get("name") or "") == kb_name]
+            if grant_access:
+                if not existing:
+                    kb_list.append({"name": kb_name, "resource_id": f"admin:kb:{kb_name}"})
+                    await save_grant(user_id, grant)
+            elif existing:
+                grant["knowledge_bases"] = [
+                    item for item in kb_list if str(item.get("name") or "") != kb_name
+                ]
                 await save_grant(user_id, grant)
-        elif existing:
-            grant["knowledge_bases"] = [
-                item for item in kb_list if str(item.get("name") or "") != kb_name
-            ]
-            await save_grant(user_id, grant)
-    except Exception:
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _SYNC_KB_GRANT_RETRIES - 1:
+                await asyncio.sleep(_SYNC_KB_GRANT_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if grant_access:
         logger.warning(
-            "Failed to sync course KB grant for user %s, kb %s", user_id, kb_name, exc_info=True
+            "Failed to grant course KB access for user %s, kb %s after %d attempts",
+            user_id,
+            kb_name,
+            _SYNC_KB_GRANT_RETRIES,
+            exc_info=last_exc,
         )
+        return
+    logger.error(
+        "Failed to revoke course KB access for user %s, kb %s after %d attempts — "
+        "this student may still be able to retrieve this course's materials via chat",
+        user_id,
+        kb_name,
+        _SYNC_KB_GRANT_RETRIES,
+        exc_info=last_exc,
+    )
+    raise RuntimeError(
+        f"Enrollment change saved, but revoking course-material chat access for "
+        f"user {user_id} failed after {_SYNC_KB_GRANT_RETRIES} attempts. Their "
+        f"enrollment status is updated correctly, but they may still be able to "
+        f"retrieve this course's materials via chat — please retry or check "
+        f"manually."
+    ) from last_exc
 
 
 def new_course_unit_id() -> str:
