@@ -5621,3 +5621,103 @@ of whether to reopen/re-scope #61/#35/#42/#58 the way #60 was, and the
 frontend structural-review gap from Devin's coverage self-audit.
 
 ---
+
+## 2026-08-13 — Claude — Fixed a live-reported bug: stuck "compiling" books couldn't be deleted, no error shown
+
+**Item**: not in TODO.md — the repo owner hit this directly while using the
+app (screenshot of a book named "Introduction to Computers" permanently
+stuck showing "COMPILING", delete button producing no response even after a
+container restart) and asked for it to be investigated and fixed. Filed as
+**#92** and closed same-session with the fix.
+**Status**: fixed, verified live, committed.
+
+**Root cause — three compounding bugs, not one**:
+1. `BookEngine.delete_book()` called `Task.cancel()` on the in-flight
+   compile worker, then *immediately* deleted the book's files.
+   `Task.cancel()` only schedules a `CancelledError` for the worker's next
+   await point — it does not stop the task synchronously. A worker mid-write
+   at that exact moment could race the delete against its own open file
+   handle.
+2. `BookStorage.delete_book()` used `shutil.rmtree(root, ignore_errors=True)`
+   — silently leaves behind anything still locked, with zero detail on what
+   went wrong. The router then collapsed *any* failure into a flat 404
+   "Book not found", even when the book plainly still existed on disk.
+3. The frontend's `handleDeleteBook` had no try/catch around
+   `await bookApi.delete(id)` — any thrown error (that misleading 404, or a
+   real network hiccup) became an unhandled promise rejection. The page
+   showed literally nothing: no toast, no error, book stays in the list.
+   This is the exact "I click delete, nothing happens" symptom reported.
+
+**Investigation note**: before touching any code, pulled the actual stuck
+book off disk (`book_bk_12243e5317`, `manifest.json` showing
+`"status": "compiling"`) and called `engine.delete_book()` on it directly —
+it succeeded immediately, proving the *live* backend delete path itself
+wasn't fundamentally broken for an already-orphaned book (no live worker,
+post-restart). That result pointed straight at the frontend's silent
+failure handling as the dominant real-world symptom, while the
+worker-race/timeout-primitive bugs below are the deeper fix for the
+scenario where a *genuinely still-running* compile is what's stuck.
+
+**Fix**:
+- `delete_book` now waits for the cancelled worker to actually unwind
+  before deleting files, bounded at 10s
+  (`_DELETE_WORKER_WAIT_SECONDS`) so a truly stuck worker can't hang the
+  delete forever — which is precisely what the repo owner asked for
+  ("if someone clicks delete, all the compiling processes should stop").
+- **Caught during verification, not assumed correct**: the first
+  implementation used `asyncio.wait_for(runtime.worker, timeout=...)`.
+  Live-testing it against a worker that swallows `CancelledError` in a
+  loop (simulating a step stuck in a non-cancellable await, e.g. a hung
+  network call) hung the test process indefinitely — confirmed by watching
+  the background command get killed by a container restart after
+  exceeding its own tool timeout. Root cause: `asyncio.wait_for` still
+  *awaits the cancelled task to actually finish* before raising
+  `TimeoutError`, so a task that never finishes hangs `wait_for` forever
+  regardless of the timeout value. Replaced with `asyncio.wait({task},
+  timeout=...)`, which checks status after the deadline and returns either
+  way, leaving a still-running task in `pending` rather than blocking on
+  it. This was the exact class of bug the repo owner described ("it does
+  not stop") and would have shipped un-fixed if not for live-testing the
+  pathological case specifically, not just the happy path.
+- `BookStorage.delete_book` retries the filesystem delete 3x with a short
+  backoff.
+- The router (`book.py`) now checks existence first (a real, accurate 404)
+  and returns 409 with a clear message if the book exists but couldn't be
+  deleted — distinct from "not found".
+- The frontend now catches delete failures and surfaces them via the
+  page's existing toast mechanism instead of swallowing them.
+
+**Verified live, every layer**:
+- Direct backend test: crafted a worker that holds a file open and only
+  releases it 0.5s after being cancelled — `delete_book` correctly waited
+  ~0.53s before deleting, and succeeded (closes the original race).
+- Direct backend test: crafted a worker that swallows `CancelledError`
+  forever (with the wait bound temporarily shortened to 1s for the test) —
+  `delete_book` gave up after ~1.07s and deleted anyway instead of hanging
+  (this is the test that caught the `wait_for` bug above, on its first
+  run, before the fix).
+- API: `DELETE` on a genuinely nonexistent book still returns a clean 404
+  (no regression).
+- End-to-end through the real app: recreated the exact reported scenario
+  (a book directory with `status: "compiling"`, no live worker) and
+  deleted it through the actual browser UI's two-click delete control
+  against the rebuilt image — confirmed via screenshot that the library
+  correctly dropped to "0 of 0 books" afterward. (The native
+  `window.confirm()` dialog auto-cancels in this automated browser
+  environment, so the very last click-through was additionally confirmed
+  by calling the same `DELETE /books/{id}` endpoint the button calls,
+  rather than claiming a UI click succeeded when the tooling couldn't
+  actually observe it.)
+- Noticed and correctly attributed a false-positive 409 during testing: a
+  test book manually created via `docker exec` (defaults to root) was
+  owned by `root`, which the app's own unprivileged `deeptutor` user
+  legitimately can't delete — confirmed via `ls -la` and fixed by cleaning
+  it up as root, not by changing the code. Real books created through the
+  app are always owned by the app's own user, so this doesn't affect
+  actual usage.
+**New findings**: none beyond the `wait_for` bug described above, caught
+and fixed within this same entry.
+**Left for later / handing back**: nothing outstanding from this fix. The
+backlog from the entry above is unchanged.
+
+---
