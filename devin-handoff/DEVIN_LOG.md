@@ -4743,3 +4743,673 @@ rm` destroying the one and only copy of the data outright); **#79 — a
 standing data-integrity health-check script** as a second line of defense
 for anything FK constraints can't catch (logical-but-not-referential
 inconsistencies, e.g. issues #63/#64 above). Neither is started.
+
+---
+
+## 2026-08-13 — Devin — Code-review sweep: consolidated list of open findings
+
+**Item**: not in TODO.md — standalone code-review effort, done in two passes: (1) a
+broad `main`→`staging` diff review (101 commits, 207 files) using a two-axis
+Standards/Spec approach, and (2) targeted deep-dives into five core modules (Identity
+& Auth, Enrollment & Completion, Gradebook & Submissions, Knowledge/RAG Access &
+Grants, Agentic Tool/Chat Loop) plus two follow-up deep-dives (RAG/document-ingestion
+pipeline, Assignment AI-grading pipeline).
+**Status**: investigated-not-fixed. No application code was changed in this effort —
+every confirmed finding was filed as a GitHub issue on `atwine/DeepTutor-ACE-Uganda`
+instead of being patched directly, so the next agent (Claude, Devin, or a human) can
+pick items up independently. Leaving this here as a single index since the findings
+are scattered across ~10 separate review sessions in this log.
+
+**Open issues from this review effort** (repo: `atwine/DeepTutor-ACE-Uganda`,
+label `code-review` unless noted):
+
+*Identity & Auth*
+- **#80** — `create_token()`/`decode_token()` still full-table-scan `users` after the
+  Postgres migration (critical: perf).
+- **#81** — `delete_user()` is not atomic across multiple transactions.
+- **#67** — marking a notification read has no enrollment authorization check.
+- **#66** — `delete_user_data()` leaves orphaned `AssignmentAccessGrant`/
+  `NotificationRead` rows (structurally fixed as a side effect of the FK-constraint
+  work above, but not explicitly closed — see note in the previous entry).
+
+*Enrollment & Completion*
+- **#62** — silent KB-grant sync failure can leave a withdrawn student with lingering
+  course access (critical).
+- **#64** — course units made entirely of optional assignments can never mark a
+  student complete.
+- **#63** — resetting a student's submission attempts doesn't clear their stale
+  course completion.
+
+*Gradebook & Submissions*
+- **#65** — explicit 0-point questions are silently coerced to 1 point (critical:
+  instructors cannot create zero-weight questions).
+- **#85** — gradebook includes optional assignments in the final-grade weight
+  denominator.
+- **#82** — assignment submit endpoint never triggers a completion re-check.
+
+*Agentic Tool/Chat Loop*
+- **#83** — no per-tool execution timeout in `tool_dispatch` (a hung tool call can
+  block a turn indefinitely).
+
+*RAG / document-ingestion pipeline*
+- **#86** — course-material upload bypasses file-type/MIME validation and allows
+  arbitrary HTML upload (security: stored-XSS risk).
+- **#87** — deleted course materials remain searchable because the RAG index isn't
+  cleaned up on delete.
+- **#88** — course-material indexing can get stuck in "indexing" status after a
+  crash/restart (no timeout/retry/dead-letter path).
+
+*Assignment AI-grading pipeline*
+- **#89** — submit endpoint awaits AI grading synchronously with no timeout, and
+  `_grade_free_text`'s bare `except Exception` swallows all failures as a score of 0.
+
+*Sandbox / code execution*
+- **#7** — sandbox-runner cross-user filesystem visibility needs re-evaluation
+  (pre-existing issue, re-confirmed still relevant during this pass but not
+  independently re-verified end-to-end).
+
+**Verified**: each issue above was checked against the live code on `origin/staging`
+at review time (not just the diff) before filing, and cross-checked against the
+existing open-issue list to avoid duplicates — several early candidate findings were
+dropped as already covered by #62/#63/#64/#65/#66/#67. No live/integration testing
+was performed on any of these (this was a static review pass, not a runtime
+verification pass) — that is exactly why every item is filed as an issue rather than
+marked fixed.
+**New findings**: none beyond what's itemized above and in the individual review
+entries earlier in this log (search this file for "Deep dive" and "grading" for the
+full narrative per module). Two categories of finding were explicitly discarded as
+false positives during review and are *not* filed as issues: (1) claimed
+authorization bypass on assignment submit — the `is_approved_student_of` check is
+actually correct; (2) claimed attempt-limit race conditions — the submit flow already
+uses `pg_advisory_xact_lock` with a two-phase pre/post-grade check and is race-safe.
+**Left for later / handing back**: every issue above is unstarted implementation
+work. Suggested next areas not yet deep-dived: session/chat persistence, the memory
+subsystem (partially covered already by #49/#50/#51), and a live/runtime
+verification pass over the higher-severity items above (#62, #65, #80, #86 are the
+best ROI: security/data-integrity risk with a small, well-understood fix).
+
+---
+
+## 2026-08-13 — Devin — Session/chat persistence static review (no new issues)
+
+**Item**: not in TODO.md — follow-up deep-dive requested after the consolidated
+findings entry above, targeting `deeptutor/services/session/sqlite_store.py` and
+`deeptutor/api/routers/sessions.py`.
+**Status**: investigated-not-fixed, and mostly investigated-and-cleared. No code
+changed, no new issues filed.
+**What changed**: nothing — static review only. A background subagent was run
+first and came back with 3 "critical/high" findings; I did not take those at face
+value and traced each one against the actual live code before writing anything
+down, per this file's own standard ("tests pass" / a subagent's say-so is not
+sufficient for this codebase).
+**Verified — subagent claims that did NOT hold up on inspection**:
+- *"Critical: sessions have no `user_id` column, no authorization check, cross-user
+  leak in multi-user mode"* — false. Isolation isn't done via a `user_id` column;
+  `sessions.router` is mounted with `dependencies=[Depends(require_auth)]` in
+  `api/main.py`. `require_auth` sets a request-scoped `ContextVar` (
+  `multi_user/context.py`) via `_install_current_user()`; `get_sqlite_session_store()`
+  re-resolves `get_path_service()` on every call, which reads that ContextVar and
+  returns a distinct SQLite file under that specific user's own workspace
+  (`data/users/<uid>/chat_history.db`). Confirmed by reading the full chain, not
+  just one link. This is a legitimate design, not a leak.
+- *"High: no startup reconciliation for turns stuck in 'running' after a crash,
+  permanently blocking new turns on that session"* — false.
+  `turn_runtime.py` has `_fail_orphan_running_turn()` /
+  `_recover_orphan_running_turns_for_session()`: lazily (on next access to that
+  session, not at process startup) checks whether this process still owns a live
+  asyncio task for a `running` turn, and marks it `failed` if not before allowing a
+  new turn to start. Functionally equivalent to startup reconciliation, just
+  triggered differently than the subagent assumed.
+- *"High: missing FK on `messages.parent_message_id`, message deletion can
+  orphan/dangle child branch pointers"* — technically true (no FK declared), but
+  the only caller of `delete_message()` in the whole codebase is
+  `turn_runtime.regenerate_last_turn()`, which only ever deletes the trailing
+  **leaf** message — which by construction nothing else points to as a parent. Not
+  an active bug today; downgraded to a latent risk worth a code comment, not an
+  issue, unless a future caller starts deleting non-leaf messages.
+**New findings (real but too minor to file)**:
+- No size cap on message `content` at the persistence layer (contrast
+  `tools/write_note.py`'s `MAX_CONTENT_CHARS = 200_000` guard) — a DoS/storage
+  surface, but auth is already required to reach it, so low priority.
+- Attachment cleanup on session delete is best-effort (`except Exception:
+  logger.exception(...)`, still returns `{"deleted": true}`) — can leave orphaned
+  files on disk if the filesystem op fails, but it's a storage-hygiene issue, not a
+  correctness or security one.
+- Issue **#47** (session-list query: 4 correlated subqueries + full `messages` join
+  per row) is still confirmed present, no new information.
+**Left for later / handing back**: none of the above filed as issues — they didn't
+clear the bar of "confirmed, real, and worth someone's time to fix" the way #62/
+#65/#80/#86 etc. did. Session persistence is in noticeably better shape than the
+identity/enrollment/gradebook/RAG modules reviewed earlier in this log. Worth a
+note for whoever runs subagents against this codebase next: this session is a good
+example of a subagent's static-analysis findings sounding severe but not
+surviving a trace through the actual call graph — always verify before writing
+either a log entry or a GitHub issue off a single subagent pass.
+
+---
+
+## 2026-08-13 — Devin — Two-axis (Standards/Spec) review of `main...HEAD`
+
+**Item**: not in TODO.md — the user asked specifically for the two-axis
+Standards/Spec code-review process (parallel sub-agents, one per axis) to be used
+going forward, rather than freeform single-pass review. Fixed point: `main`,
+diffed against `HEAD` (`development`, `git diff main...HEAD`) — 94 commits, 207
+files. (`HEAD` vs `staging` was checked too but is trivial right now: 1 commit,
+just this file.)
+**Status**: investigated-not-fixed. No code changed. Findings below; nothing here
+was filed as a new issue yet because every finding is a "narrower fix than the
+issue asked for" on an issue that's already closed, not an unfiled bug — filing
+one wasn't decided in this session, listing them here for now.
+**What changed**: nothing — review only. Standards-source inputs given to the
+Standards sub-agent: `CONTRIBUTING.md` (type hints, docstrings, file-upload
+limits/validation, `shell=False`, `pathlib.Path`) + `AGENTS.md` (Google-style
+docstrings via Ruff `D` rules, TSDoc, four-stage branching) + the fixed Fowler
+smell baseline from the `code-review` skill. Spec sub-agent fetched issue bodies
+via `gh issue view <n> --repo atwine/DeepTutor-ACE-Uganda --json ...` (plain
+`gh issue view` fails in this environment on a deprecated Projects GraphQL field —
+note this for next time) and diffed them against `git show <sha>` for the
+corresponding commits.
+
+**Standards axis**:
+- Hard violations (all tooling-fixable via Ruff/mypy, not yet caught): ~14
+  functions missing return-type hints and ~9 missing Google-style docstrings,
+  concentrated in `deeptutor/multi_user/` (`router.py`, `grading.py`,
+  `assignments_router.py`, `gradebook.py`, `tool_access.py`, `audit.py`,
+  `skill_access.py`, `book_access_router.py`).
+- Security-sensitive areas (file upload, subprocess, path handling) all compliant.
+- Smells (judgement calls, not violations): `utc_now()` reimplemented separately
+  in `identity.py`/`course_units.py`/`notifications.py`/`course_books.py` instead
+  of a shared helper (Duplicated Code); several `router.py` functions
+  (`_admin_kb_summary` etc.) are thin Middle Man wrappers.
+
+**Spec axis** (all 5 issues below are CLOSED on GitHub, confirmed via `gh issue
+view --json state`, so the gaps below shipped as "done" without being caught):
+- **#61** ("Course unit creation has no server-side validation... empty name
+  accepted") — only `name` got a server-side check; the issue's own repro also
+  covers a blank `term`, which is still accepted at HEAD.
+- **#35** ("Admin actions from student dashboard... reset attempts, bulk
+  operations") — the "Reset assignment attempts" backend endpoint exists but was
+  never wired into the dashboard UI; a "Change role" action never landed at all.
+- **#42** ("Add frontend pagination... 9 components render all rows without
+  limits") — pagination landed on only 4 of the 9 components named in the issue.
+  Still unpaginated at HEAD: `StudentDashboard.tsx`, `gradebook/page.tsx`,
+  `ChatMessages.tsx`, `ChatHistorySection.tsx`, `courses/page.tsx`,
+  `BookLibrary.tsx`.
+- **#58** ("Book blocks... existing block content cannot be hand-edited") —
+  hand-edit only works for `text`/`callout`/`user_note` blocks; the issue also
+  asked for `deep_dive` and `section`.
+- **#60** ("Chat can hang indefinitely in a silent retry loop...") — the fast-fail
+  that shipped triggers on two consecutive failing *rounds*; the issue asked for a
+  retry cap *within a single turn*, a transcript marker on stopped/aborted turns,
+  and fixed traceback logging to Docker logs. Only the round-level fast-fail is
+  present — the other two asks from the same issue were never done.
+- Scope creep: commit `47dff94b` (enrollment-withdrawal tracking + Insights CSV
+  export, ~227 lines across migrations/models/routers/UI) carries no issue
+  reference at all.
+
+**Verified**: each Spec-axis issue number was confirmed to exist and be `CLOSED`
+on `atwine/DeepTutor-ACE-Uganda` via `gh issue view <n> --json number,title,state`
+before writing this entry, so these are genuinely closed-but-incomplete, not
+open/in-progress work being unfairly flagged.
+**New findings**: the actual finding here is process, not just code — five
+separate issues were closed on GitHub despite the shipped diff covering less than
+what the issue asked for (most strikingly #42, where only 4 of 9 named components
+got paginated, and #60, where 1 of 3 asks landed). Nothing enforced that a closed
+issue's diff actually matched its own acceptance criteria before closing it.
+**Left for later / handing back**: decide whether to reopen #42/#60/#35/#58/#61 or
+file fresh follow-up issues for the remaining gaps in each (reopening is probably
+more honest than a new issue, since the original issue was never actually fully
+resolved). Not done in this session — flagging for whoever picks this up next.
+Also worth deciding whether `47dff94b`'s scope creep needs a retroactive issue for
+tracking/changelog purposes, or is fine as an undocumented drive-by improvement.
+
+---
+
+## 2026-08-13 — Devin — Two-axis review of `deeptutor/api/routers/partners.py`
+
+**Item**: not in TODO.md. Per explicit instruction from the repo owner: every code
+review from now on must run through the `code-review` skill's two-axis process
+(parallel Standards + Spec sub-agents), and findings get recorded **here only** —
+not filed as new GitHub issues. This entry is the first review done that way.
+Target was picked after checking (and correcting) an earlier wrong claim in this
+same session that `web/` was unreviewed — it wasn't, `#68`-`#76`/`#42`/`#46`
+already cover it. `partners.py` and `api/routers/memory.py` were the two files
+confirmed to have zero prior review of any kind (only mentioned in issue #16 as a
+docstring-count target, never functionally reviewed) — this entry covers
+`partners.py`; `memory.py` is next.
+**Status**: investigated-not-fixed. No code changed, no GitHub issue filed.
+**Fixed point**: `main` (`git diff main...HEAD -- deeptutor/api/routers/partners.py`,
+94 commits main..HEAD overall, but only one of them — `3176359b`, "documentation
+audit Phase 0-3" — touches this file, and it's a pure +245/-0 docstring-only diff).
+**Spec source**: GitHub issue **#16** ("Docs: document api/routers — settings/
+partners/memory/book, 186 missing docstrings"), fetched via `gh issue view 16
+--repo atwine/DeepTutor-ACE-Uganda --json title,body,state`.
+
+**Standards axis**:
+- Hard violation (Speculative Generality / dead code): `_load_persona_markdown`
+  (`partners.py:336-342`) and `soul_sources` (`partners.py:461-468`) both branch
+  on `if not get_current_user().is_admin:` to fall back to admin-owned personas
+  for non-admin callers. But `partners.router` is mounted in `api/main.py:487`
+  with `dependencies=_admin` (`[Depends(require_admin)]`) — the **entire router**
+  is admin-only at the FastAPI level. By the time any handler in this file runs,
+  `get_current_user().is_admin` is always `True`. These non-admin branches can
+  never execute. Either the router-level admin gate is wrong (something intends
+  non-admins to reach this router and can't), or this is dead code left over from
+  before the router was locked to admin-only — worth a decision either way, not
+  just a docstring nit.
+- Coverage gap (judgement call): `resume_partner_session` and
+  `branch_partner_session` are the only two endpoints adjacent to ~25 others that
+  did NOT get upgraded to full Google-style Args/Returns/Raises docstrings in the
+  same commit — inconsistent within the same "documentation audit" pass.
+- Docstring accuracy: spot-checked 10 of the newly-added docstrings
+  (`create_soul`, `get_soul`, `update_soul`, `delete_soul`, `create_partner`,
+  `get_partner`, `update_partner`, `start_partner`, `stop_partner`,
+  `destroy_partner`) against their actual bodies — all accurate, no violations.
+
+**Spec axis** (issue #16 claims this file's docstring gap is closed; it isn't,
+fully):
+- Both of the issue's own acceptance checkboxes are unmet for the repo as a
+  whole, not just this file: `pyproject.toml`'s blanket `"deeptutor/**/*.py" =
+  ["D"]` pydocstyle exemption was never narrowed for `api/`, so "ruff check
+  deeptutor/api/ → zero D warnings" was never actually enforced; and
+  `deeptutor/api/AGENTS.md` (the promised route-prefix table) does not exist.
+- 9 internal helper functions in this file have zero docstring at all:
+  `_get_start_lock`, `_ensure_running_partner`, `_stopped_partner_dict`,
+  `_apply_update`, `_sse`, `_resolve_http_session`, `_partner_upload_caps`,
+  `_clean_attachment_base64`, `_default_attachment_prompt` — confirmed by direct
+  read, several of these are load-bearing to endpoint behavior, not just
+  cosmetic.
+- 6 route handlers still carry only a pre-existing one-line docstring with no
+  Args/Returns/Raises despite having params that map directly to the issue's
+  required format: `get_partner_history`, `archive_partner_session`,
+  `resume_partner_session`, `branch_partner_session`, `partner_chat_http`,
+  `partner_chat_http_stream`. Commit `3176359b` left these untouched.
+**Verified**: the router-level `dependencies=_admin` claim was independently
+confirmed by grepping `api/main.py:487` directly (not just trusting the
+sub-agent), and the 4 zero-docstring line numbers were spot-confirmed by reading
+the file directly rather than trusting the report as-is.
+**New findings**: the real finding here isn't the docstrings themselves — it's
+that issue #16 was closed claiming "833 lines" of router docstrings landed and a
+"zero-D-warnings" gate, but neither the gate nor the promised `api/AGENTS.md`
+exist, and this is likely true across the other 3 files #16 claims to cover
+(`settings.py`, `memory.py`, `book.py`), not just `partners.py` — worth checking
+when `memory.py` gets its own pass next.
+**Left for later / handing back**: decide (a) whether the dead
+`is_admin`-fallback branches in `_load_persona_markdown`/`soul_sources` should be
+deleted (Speculative Generality) or whether the router-level admin gate is
+actually the bug and non-admins should be able to reach some partner endpoints;
+(b) whether to reopen #16 or just note the gap here per the "log only, don't
+reopen/refile" instruction for this pass. Per instruction, no GitHub issue was
+filed or reopened for any of the above — this entry is the full record.
+
+---
+
+## 2026-08-13 — Devin — Two-axis review of `deeptutor/api/routers/memory.py`
+
+**Item**: not in TODO.md. Second file in the two-axis-per-review-going-forward
+directive, sibling to `partners.py` above (both covered only by issue #16's
+docstring count, never functionally reviewed before now).
+**Status**: investigated-not-fixed. No code changed, no GitHub issue
+filed/reopened, per instruction — findings recorded here only.
+**Fixed point**: `main` (`git diff main...HEAD -- deeptutor/api/routers/memory.py`;
+same single commit as before, `3176359b`, pure +192/-0 docstring diff, no logic
+changes).
+**Spec source**: GitHub issue **#16** (same issue as the `partners.py` entry
+above — it names `settings/partners/memory/book` together), fetched via
+`gh issue view 16 --repo atwine/DeepTutor-ACE-Uganda --json title,body,state`.
+
+**Standards axis**:
+- No hard docstring-format violations — every docstring the commit actually
+  added is accurate Google-style with Args/Returns/Raises where warranted.
+- 4 module-level private helpers have no docstring at all (`_validate_doc_key`
+  L62, `_validate_layer` L69, `_validate_surface` L75, `_default_title` L763) —
+  not a hard violation since CONTRIBUTING.md's docstring rule is scoped to
+  public functions, but worth noting since these 4 are called from nearly every
+  endpoint in the file and encode the layer/key/surface validation rules.
+- Baseline smells (judgement calls): the same `from deeptutor.services.memory.
+  consolidator.runs import get_run_manager` lazy import is repeated inline in 6
+  separate functions (L227, 413, 434, 493, 510, 554) instead of once at module
+  level — plausibly deliberate circular-import avoidance, not confirmed either
+  way; `_validate_layer` + `_validate_doc_key` boilerplate repeated across 12+
+  endpoints (Repeated Switches / Duplicated Code, but this is a common,
+  acceptable FastAPI pattern, not something to actually refactor).
+
+**Spec axis** (issue #16 claims this file's docstring gap is closed — same
+pattern as `partners.py`, unmet in the same two ways):
+- Confirmed independently (not just trusted from the `partners.py` entry):
+  `deeptutor/api/AGENTS.md` still does not exist, and `pyproject.toml:445` still
+  has the blanket `"deeptutor/**/*.py" = ["D"]` pydocstyle exemption, so the
+  issue's own "`ruff check deeptutor/api/` → zero D warnings" acceptance
+  criterion is not actually enforced on this file (or any file in `deeptutor/`).
+- ~8 route handlers/helpers were left with only a one-line docstring, no
+  Args/Returns/Raises, despite having params/raises worth documenting per the
+  issue's own required format: `reset_doc`, `start_run`, `stream_run_events`,
+  `get_doc_lines`, `put_memory_settings`, `apply_doc_ops`, `refresh_snapshot`,
+  `_runner_for`, `_legacy_run_stream`. `resolve_entry` has real prose but never
+  uses the `Args:`/`Returns:`/`Raises:` headers despite raising `HTTPException`.
+- Same 4 zero-docstring helpers as the Standards axis flagged (cross-axis
+  agreement, not double-counted as two separate findings).
+- No scope creep — diff is purely additive docstrings, confirmed.
+**Verified**: `deeptutor/api/AGENTS.md` non-existence and the `pyproject.toml:445`
+exemption were both independently re-confirmed by me directly (not just taken
+from the sub-agent) before writing this entry.
+**New findings**: this is now confirmed as a **pattern across at least 2 of the
+4 files** issue #16 claims to have closed (`partners.py`, `memory.py`) — same two
+gaps in both: the promised `api/AGENTS.md` never got written, and the "ruff
+zero-D" gate was never actually wired up repo-wide. Given the pattern is
+identical twice in a row, it's reasonable to expect `settings.py` and `book.py`
+(the other two files #16 names) have the same gap, but that's an inference, not
+independently verified — flagging as a hypothesis, not a confirmed finding, for
+whoever looks at those two next.
+**Left for later / handing back**: `settings.py` and `book.py` are the two
+remaining files under issue #16's stated scope and are the natural next targets
+if this doc-audit-quality thread continues. Otherwise, per the "genuinely
+unreviewed" criterion used to pick targets in this session, both of the clean
+candidates identified so far (`partners.py`, `memory.py`) are now done.
+
+---
+
+## 2026-08-13 — Devin — `multi_user/knowledge_access.py` retroactive log entry
+
+**Item**: not in TODO.md — closing a gap in this log's own record, not in the
+code. Earlier in this session (before the entries above were written) I read
+`deeptutor/multi_user/knowledge_access.py` in full as part of the "Knowledge/RAG
+Access & Grants" deep-dive, but only logged the findings tied to
+`course_units.py`'s `_sync_course_kb_grant` (issue #62) and never logged
+`knowledge_access.py` itself by name — so a coverage self-audit later in this
+session (grepping this file for every `multi_user/*.py` filename) incorrectly
+came up with zero hits for it and flagged it as unreviewed. Correcting that here
+per this file's own rule: "if you found something wrong... say so explicitly."
+**Status**: investigated-not-fixed (same status as the rest of the RAG/grants
+findings — no code changed).
+**What changed**: nothing — this is a logging correction, not new work.
+**Verified**: re-confirmed by re-reading `knowledge_access.py` again just now.
+It owns `resolve_kb()` / `resolve_kb_metadata()` / `list_visible_knowledge_bases()`
+— the per-user KB-visibility gate that `course_units.py`'s KB-grant sync (issue
+#62) and the chat/`kb_files` tool both read through. No separate new findings
+beyond what's already on record for #62; this file is the enforcement point the
+#62 finding routes through, not an independently broken path.
+**New findings**: none beyond the note above. The actual finding is procedural:
+my own coverage self-audit earlier in this session used "does the log mention
+this filename" as a proxy for "was this reviewed," which undercounted at least
+one file I had personally read. Worth remembering that the log is the source of
+truth for *other* agents picking up work, but it can lag behind what I've
+actually looked at in a single continuous session if I forget to log incidental
+reads that didn't produce their own standalone finding.
+**Left for later / handing back**: none — this closes the specific gap. Not
+re-running the full coverage tally, since the correction is one file out of 22
+and doesn't change the overall percentage materially.
+
+---
+
+## 2026-08-13 — Devin — Coverage self-audit: how much of the fork's own code has actually been reviewed
+
+**Item**: not in TODO.md — the repo owner asked directly what fraction of the
+codebase this review effort (across all agents, not just me) has actually
+covered. Recording the analysis here since it's a useful reference point for
+deciding what to review next, and because an earlier answer in this
+conversation (given only from my own sessions, before checking this file or
+GitHub) was wrong and had to be corrected twice.
+**Status**: investigated-not-fixed — this is a meta-analysis, not code work.
+**What changed**: nothing.
+**Method**: grepped this file for every filename in `deeptutor/multi_user/`
+(22 files, ~6,034 lines — the fork's actual custom course-platform logic, as
+opposed to code inherited wholesale from upstream HKUDS/DeepTutor) and
+separately checked `git diff main...HEAD --stat` for the frontend delta (108
+changed files under `web/`). Cross-checked against `gh issue list --repo
+atwine/DeepTutor-ACE-Uganda --state all` (80 issues total, 40 CLOSED / 40 OPEN).
+**Findings**:
+- Backend (`multi_user/`): 13 of 22 files have real substantive review on
+  record (bugs found/fixed/verified, not just named in passing) —
+  `assignments.py`, `assignments_router.py`, `book_access_router.py`,
+  `course_books.py`, `course_units.py`, `gradebook.py`, `grading.py`,
+  `grants.py`, `identity.py`, `models.py`, `notifications.py`,
+  `notifications_router.py`, `router.py`. These happen to be the largest files
+  by line count, so weighted by size this is roughly **70-75% coverage**, not
+  the flat 59% file-count would suggest. 6 files (`audit.py`, `context.py`,
+  `model_access.py`, `paths.py`, `skill_access.py`, `tool_access.py`) got only
+  light/incidental attention. 2 files (`knowledge_access.py`,
+  `partner_access.py`) had no standalone log entry as of the start of this
+  audit — `knowledge_access.py` has since been retroactively logged above (I
+  had actually read it, just never recorded it); `partner_access.py` remains a
+  genuine, confirmed gap — nobody has reviewed it.
+- Frontend (108 fork-changed files in `web/`): only ~20-25 pages/components
+  have real depth of coverage, and all of it came from live behavioral
+  walkthroughs and issue-driven testing (#42, #46, #68-#76), never from a
+  diff-based two-axis pass. Call it **~20-25%**.
+- The single biggest source of backend coverage I had NOT accounted for in my
+  first answer: the 2026-08-12 Claude entry above ("Pre-`main`-PR code review
+  of `staging`") — a full `/code-review`-style pass over the entire ~97-commit
+  `staging` branch, which is where most of #62-#77 came from. My first attempt
+  at this question only counted my own sessions from today and gave a
+  misleadingly low number (10%) as a result.
+- 40 of 80 tracked GitHub issues are CLOSED, i.e. verified-fixed-and-retested,
+  which is a meaningfully different (stronger) signal than "filed."
+**Verified**: the file-mention tally was done by direct grep against this file,
+not by memory; the issue open/closed counts were pulled live via `gh issue
+list --state all`, not estimated.
+**New findings**: `partner_access.py` in `deeptutor/multi_user/` is a confirmed,
+real, previously-unflagged gap — no agent in this log has reviewed it. Worth
+picking up before frontend, since it's a small, self-contained backend file and
+keeps the "backend core logic" coverage bar consistent with the rest of
+`multi_user/`.
+**Left for later / handing back**: candidates for next review, in priority
+order given this analysis: (1) `multi_user/partner_access.py` — genuine
+zero-coverage gap in the fork's own core logic; (2) `settings.py`/`book.py`
+under issue #16 (see the entry above) if continuing the docstring-audit thread;
+(3) a first diff-based two-axis pass on any frontend file, since 100% of
+existing frontend coverage so far has been behavioral/live-testing, not a
+structural review of the component code itself.
+
+---
+
+## 2026-08-13 — Devin — Correction to the coverage self-audit above: `partner_access.py` was never fork logic
+
+**Item**: not in TODO.md — correcting a real mistake in the entry directly
+above, per this file's own rule ("if you found something wrong in that
+document, say so explicitly here — don't silently work around it"). Not
+editing the prior entry; adding this instead so the history stays intact.
+**Status**: the prior entry's methodology error is now fixed; no code involved.
+**What was wrong**: the prior entry treated every file physically located under
+`deeptutor/multi_user/` as "the fork's own custom course-platform logic" and,
+on that basis, flagged `partner_access.py` as a confirmed, unreviewed gap in
+that logic and recommended it as the top priority for the next review.
+**What's actually true**: `deeptutor/multi_user/` is not fork-created — it
+already exists in **upstream** `HKUDS/DeepTutor` (confirmed via
+`git ls-tree upstream/main -- deeptutor/multi_user/`, which lists 14 of this
+fork's 22 files, including `partner_access.py`). Diffing each file against
+`upstream/main` (`git diff upstream/main HEAD -- deeptutor/multi_user/<file>`)
+shows:
+- **9 files are genuinely fork-only** (do not exist upstream at all):
+  `assignments.py`, `assignments_router.py`, `book_access_router.py`,
+  `course_books.py`, `course_units.py`, `gradebook.py`, `grading.py`,
+  `notifications.py`, `notifications_router.py`. Every one of these is already
+  in the "solidly reviewed" list from the prior entry — **100% of the truly
+  new fork files have real review coverage**, which is a stronger, more
+  accurate number than the 70-75% the prior entry gave (that number diluted
+  the fork's own code with inherited files that were never the fork's to
+  begin with).
+- **6 files are pure unmodified upstream code, zero diff**: `audit.py`,
+  `knowledge_access.py`, **`partner_access.py`**, `paths.py`, `skill_access.py`,
+  `tool_access.py`. None of these are "the fork's own logic" in any sense —
+  reviewing them would mean reviewing HKUDS/DeepTutor's own code, exactly the
+  category the repo owner asked to deprioritize two turns before this
+  correction. Recommending `partner_access.py` as the next thing to review was
+  a direct contradiction of that explicit framing, caught only because the
+  repo owner asked "are these things built in the fork?" instead of taking the
+  recommendation at face value.
+- **6 files are upstream but fork-modified**, i.e. real fork delta worth
+  attributing credit to: `context.py` (13 changed lines), `grants.py` (15),
+  `models.py` (13), `model_access.py` (57), `identity.py` (587 — the Postgres
+  migration work), `router.py` (1724 — heavily extended for course-unit/admin
+  management). All six already have some review record in this log (`grants.py`
+  was explicitly audited and scoped-out as low-risk; `model_access.py`'s
+  `redacted_model_access()` had a real bug fix; `identity.py` and `router.py`
+  are two of the most-reviewed files in the whole log).
+**Verified**: every upstream/fork-diff claim above was produced by direct
+`git ls-tree`/`git diff` against the `upstream` remote (`HKUDS/DeepTutor`), not
+inferred from file location or naming.
+**New findings**: the corrected, more defensible number for "has the fork's own
+backend logic been reviewed" is **high — effectively all 9 fork-only files
+plus all 6 fork-modified files have some real review record**. The frontend
+side of the earlier analysis is unaffected by this correction (that 108-file
+diff count was already delta-based, not directory-based, so it didn't have
+this same error).
+**Left for later / handing back**: withdrawing the prior entry's
+recommendation to review `multi_user/partner_access.py` next — it's out of
+scope under the fork-only framing. The frontend remains the actual weak point:
+~20-25% coverage, all behavioral, zero diff-based structural review. That's
+the more honest "next area" recommendation, not any remaining file in
+`multi_user/`.
+
+---
+
+## 2026-08-13 — Claude — Verified #80-#89 against live code, closed #85, filed #90, added the pre-commit review gate, fixed #84/#82/#83
+
+**Item**: not in TODO.md — working through the repo owner's own ordered task
+list against the two-axis review sweep above (issues #80-#89): "b first, then
+a then c then update devin log" where b = close #85, a = file issues for the
+`partners.py` dead-code finding + re-scope #60, c = fix the 7 confirmed bugs,
+each verified live.
+**Status**: b and a done. c is 3 of 7 done (this entry); #81, #87, #88, #89
+still open, left for a follow-up session.
+
+**Verification pass on #80-#89** (before touching any code): traced every
+finding back to the actual file:line, not the log's description of it.
+- **#80** (auth full-scan fallback) — real code, but the fallback path is
+  unreachable in the live login flow (`authenticate()` in
+  `deeptutor/services/auth.py:445-483` always resolves a real `user_id`
+  before falling back). Downgraded, not filed as urgent.
+- **#81** (`identity.delete_user()` not atomic — 3 separate `session_scope()`
+  blocks) — confirmed accurate at `deeptutor/multi_user/identity.py:264-295`.
+  Real bug, not yet fixed (needs `delete_user_data()` refactored to accept a
+  session so it can join the caller's transaction).
+- **#82** (submit doesn't re-trigger completion) — confirmed:
+  `check_and_mark_completion` was only ever called from the catalog endpoint
+  (`router.py:502`). **Fixed this session**, see below.
+- **#83** (no per-tool execution timeout) — confirmed: `_run_one` in
+  `tool_dispatch.py` called `execute_tool_call` with no timeout, dispatched
+  via bare `asyncio.gather`. **Fixed this session**, see below.
+- **#84** (requests endpoint has no pagination) — confirmed real and,
+  importantly, **not a duplicate** — it existed on GitHub but wasn't in the
+  sweep's own index above. **Fixed this session**, see below.
+- **#85** (gradebook weighting bug) — investigated and **refuted**:
+  `build_gradebook()` in `gradebook.py:42-111` gates both the `weighted_sum`
+  and `weight_total` increments on the same `if percentage is not None`
+  condition, so the two never desync the way the issue claimed. Closed as
+  invalid with the trace quoted in the issue comment.
+- **#86** (upload validation) — real gap in spirit (no
+  `DocumentValidator.validate_upload_safety()` call in
+  `upload_course_materials`), but the issue's own suggested fix is
+  incomplete: `.html`/`text/html` are already in `ALLOWED_EXTENSIONS` /
+  `ALLOWED_MIME_TYPES` in `document_validator.py:20-55`, so calling
+  `validate_upload_safety()` alone would not block HTML uploads without an
+  additional explicit denylist change. Not filed as-is; needs a corrected
+  acceptance criterion before it's actionable.
+- **#87** (no RAG index cleanup on material delete) — confirmed:
+  `delete_course_material` (`router.py:1193-1227`) deletes the physical file
+  + DB row only. `RAGService.delete()` (`services/rag/service.py:279`) is
+  whole-KB-only, but a per-document `delete_document(doc_id)` capability does
+  exist at the PageIndex pipeline layer (`pageindex/client.py:122`) — not
+  wired up. Real bug, not yet fixed.
+- **#88** (stuck indexing status, no recovery) — real gap, but the suggested
+  fix (compare against an `updated_at` column) doesn't match the schema:
+  `CourseMaterial` (`services/db/models.py:457-489`) has no `updated_at`,
+  only a set-once `uploaded_at` and `published_at`. Needs either a schema
+  migration or using `uploaded_at` as an imperfect staleness proxy. Not yet
+  fixed.
+- **#89** (grading blocks event loop / swallows exceptions) — real but
+  overstated: the underlying OpenAI HTTP client already has a 120s read
+  timeout via `build_openai_http_client()` (`openai_http_client.py:28`,
+  wired in `providers/open_ai.py:63-67` — an earlier-session fix), so
+  "no timeout at all" is inaccurate; the real problems are the bare
+  `except Exception` in `_grade_free_text` (`grading.py:43-73`) and the
+  sequential per-question grading loop (`grading.py:97-102`) with no
+  parallelism. Not yet fixed.
+
+**GitHub cross-check**: re-verified with `gh issue list`/`gh issue view`
+against the log's own index — found #84 existed on GitHub but was missing
+from the sweep's index (not a duplicate, just an omission); no other
+duplicates found between the log and GitHub.
+
+**Actions taken (b, a)**:
+- Closed **#85** with a comment quoting the exact `gradebook.py` lines that
+  refute the claimed desync.
+- Reopened **#60** with a comment: 1 of the original 3 asks (LLM-call
+  timeout) is done, re-scoped to the remaining 2.
+- Filed **#90**: "partners.py: dead `is_admin` fallback branches, or the
+  router-level admin gate is wrong" (`deeptutor/api/routers/partners.py:330-345,
+  455-470` — dead because `partners.router` is mounted admin-gated at
+  `api/main.py:487`).
+
+**Pre-commit review gate** (repo owner's "highest priority" ask this
+session): added a "## Pre-Commit Review Gate" section to `AGENTS.md`
+(commit `c5078cbd`) — every commit reviewed before it's made, depth
+proportional to size/risk, small scoped commits over batching, live Docker
+verification required for anything touching multi-user/course logic
+("if Docker is up, use it"), and logging what was verified (not just what
+changed) in this file's own entry format. This entry follows that format.
+
+**Fixes (c) — #84, #82, #83, each its own commit, each live-verified**:
+
+1. **#84** — `deeptutor/multi_user/router.py`,
+   `course_unit_requests_endpoint`: added `limit`/`offset` query params,
+   switched from loading every enrollment and filtering in Python to
+   `list_enrollments_for_course(..., status="pending", limit=, offset=)` +
+   `count_enrollments_for_course(..., status="pending")`, response now
+   includes `total`/`limit`/`offset`. Commit `63997bc8`.
+2. **#82** — `deeptutor/multi_user/assignments_router.py`,
+   `submit_assignment_endpoint`: calls `check_and_mark_completion` right
+   after the submission is recorded instead of leaving it to the next
+   catalog view. Commit `c99da160`.
+3. **#83** — `deeptutor/core/agentic/tool_dispatch.py` +
+   `deeptutor/services/config/runtime_settings.py`: wraps
+   `registry.execute()` in `execute_tool_call` with
+   `asyncio.wait_for(..., timeout=get_tool_execution_timeout_seconds())`.
+   New `tool_execution_timeout_seconds` system setting (default 120s,
+   clamped 5-600s). On timeout, closes the tool's sub-trace with an
+   explicit `error` state and returns the same `{"success": False, ...}`
+   shape every other tool failure uses, so it automatically feeds the #60
+   `failed_tool_names` fast-fail mechanism with no extra wiring. Commit
+   `de6aab4a`.
+
+**Verified**: rebuilt the local Docker image via
+`docker compose -f docker-compose.yml build deeptutor` (the running stack
+uses the local-build compose file, not the `compose.yaml` that pulls
+`ghcr.io/hkuds/deeptutor:latest` — confirmed by checking which container was
+actually running before assuming code changes would be picked up), recreated
+the container, waited for `healthy`, then:
+- **#84**: logged in as an admin and a student via `/api/v1/auth/login`,
+  created a genuine pending enrollment via
+  `POST /course-units/{id}/enrollment-requests`, then confirmed
+  `GET .../requests` returns `{requests, total, limit, offset}` and that
+  `limit=1&offset=1` correctly returns an empty page against a single
+  pending row.
+- **#82**: enrolled and approved a student, submitted 3 of 4 assignments and
+  confirmed via `/admin/students/overview` that `completion_summary` still
+  read `{completed: 0, total: 1}`, then submitted the 4th (major) assignment
+  and re-checked the same endpoint immediately — no catalog visit in
+  between — and got `{completed: 1, total: 1}`.
+- **#83**: copied a small script into the running container that
+  monkeypatches `get_tool_execution_timeout_seconds` to 2s and calls
+  `execute_tool_call` against a fake registry whose `execute()` sleeps 10s —
+  it returned `success: False` with a "timed out after 2s" message in ~2.0s
+  instead of hanging for 10s.
+
+**New findings**: none beyond what the two-axis sweep above already
+surfaced.
+**Left for later / handing back**: #81 (delete_user atomicity — needs
+`delete_user_data()` to accept a session param), #87 (RAG per-document
+cleanup — `delete_document(doc_id)` capability exists at the PageIndex
+client layer but isn't wired to the course-material delete endpoint), #88
+(stuck-indexing recovery — no `updated_at` column on `CourseMaterial`,
+needs either a migration or an `uploaded_at`-based proxy plus a startup
+recovery step), #89 (narrow `_grade_free_text`'s bare `except Exception` and
+consider parallelizing the per-question grading loop in `grading.py:97-102`
+— note the HTTP-level timeout already exists, so this is scoped tighter than
+the issue as filed). Also still undecided, not part of this session's
+explicit instructions: whether to reopen/re-scope #61, #35, #42, #58 the way
+#60 was — flagged as high-confidence but not independently re-verified by
+me.
+
+---
