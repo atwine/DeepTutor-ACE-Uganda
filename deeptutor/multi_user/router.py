@@ -954,8 +954,18 @@ def _course_kb_raw_dir(kb_name: str) -> Path:
 
 def _is_rag_supported(filename: str) -> bool:
     """Whether the file's extension is supported by the RAG FileTypeRouter
-    (i.e. it will actually be indexed). Files like .ipynb are accepted as
-    uploads but not indexed -- their ingestion_status stays 'pending'."""
+    (i.e. it will actually be indexed).
+
+    Every extension currently accepted by course-material upload
+    (``_COURSE_MATERIAL_FILE_TYPES``, including ``.ipynb`` -- parsed into
+    readable cell text via ``deeptutor.utils.notebook_parser`` -- and
+    ``.pdf``/``.docx``/``.pptx``/``.xlsx``/``.md``/``.txt``) is RAG-supported
+    today, so this always returns True for a successfully-uploaded material.
+    Kept as an explicit guard rather than assuming that stays true forever --
+    if a future upload type isn't RAG-supported, it should still be stored
+    and downloadable with ``ingestion_status`` left at ``'pending'`` instead
+    of erroring, which is what the caller below relies on this for.
+    """
     from deeptutor.services.rag.file_routing import FileTypeRouter
 
     return FileTypeRouter.has_supported_extension(filename)
@@ -969,9 +979,9 @@ async def _run_material_indexing(
     Mirrors the existing KB upload path (``run_upload_processing_task`` in
     ``knowledge.py``) but lighter -- a single file, no task-stream wiring. The
     material's ``ingestion_status`` is updated (pending -> indexing ->
-    ready/failed) so the frontend can poll. Non-RAG-supported files (e.g.
-    .ipynb) skip indexing and stay 'pending' -- they're still stored and
-    downloadable, just not in the RAG index.
+    ready/failed) so the frontend can poll. Any future upload type that
+    isn't RAG-supported (see ``_is_rag_supported``) skips indexing and stays
+    'pending' -- still stored and downloadable, just not in the RAG index.
     """
     try:
         await update_ingestion_status(material_id, "indexing")
@@ -1152,9 +1162,10 @@ async def upload_course_materials(
             file_path=rel_path,
             size_bytes=written,
         )
-        # Trigger background indexing only for RAG-supported files. Non-RAG
-        # files (e.g. .ipynb) stay 'pending' -- they're stored and downloadable
-        # but not in the RAG index.
+        # Trigger background indexing only for RAG-supported files (today,
+        # that's every accepted upload type -- see _is_rag_supported). A
+        # future non-RAG-supported type would stay 'pending' -- still stored
+        # and downloadable, just not in the RAG index.
         if _is_rag_supported(dest.name):
             background_tasks.add_task(
                 _run_material_indexing,
