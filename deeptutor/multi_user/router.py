@@ -29,9 +29,11 @@ from deeptutor.api.routers.auth import (
 from deeptutor.knowledge.manager import KnowledgeBaseManager
 from deeptutor.services.config.model_catalog import ModelCatalogService
 from deeptutor.services.skill.service import SkillService
+from deeptutor.utils.document_validator import DocumentValidator
 
 from .audit import log_admin_action
 from .course_units import (
+    _COURSE_MATERIAL_FILE_TYPES,
     CourseUnitArchivedError,
     approve_enrollment,
     approve_leave,
@@ -1128,12 +1130,23 @@ async def upload_course_materials(
     materials: list[dict[str, Any]] = []
     for upload in files:
         original = upload.filename or "upload"
-        # Sanitize the filename -- strip path components, keep the extension.
-        safe_name = Path(original).name
-        if not safe_name or safe_name.startswith((".", "..")):
-            raise HTTPException(
-                status_code=400, detail=f"Invalid filename: {original}"
+        # Issue #86: this used to only strip path components -- no extension
+        # or MIME allowlist, no control-character/Unicode sanitization, so
+        # any file type (including .html, which would be served back with a
+        # guessed text/html Content-Type) could be uploaded and stored under
+        # a course KB's raw/ directory. validate_upload_safety() is the same
+        # helper the Knowledge Center upload path already uses; scoped to
+        # exactly the extensions course materials actually support (not its
+        # own broader default list, which is missing .ipynb and includes
+        # .html) via _COURSE_MATERIAL_FILE_TYPES.
+        try:
+            safe_name = DocumentValidator.validate_upload_safety(
+                original,
+                None,  # size is checked below, mid-stream, once actually known
+                allowed_extensions=set(_COURSE_MATERIAL_FILE_TYPES.keys()),
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         dest = raw_dir / safe_name
         # Avoid clobbering an existing file -- append a short suffix on collision.
         if dest.exists():
