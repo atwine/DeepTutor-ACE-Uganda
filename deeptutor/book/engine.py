@@ -31,6 +31,7 @@ which the WebSocket router fans out to clients.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 import logging
 import time
@@ -96,6 +97,13 @@ class _BookRuntime:
 # Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
+# How long delete_book waits for an in-flight compile worker to actually
+# unwind after cancellation before giving up and deleting anyway. Bounded so
+# a worker stuck in a non-cancellable await (e.g. a hung network call inside
+# a step that doesn't check for cancellation) can't hang a delete forever --
+# the exact "it does not stop" complaint this fix addresses.
+_DELETE_WORKER_WAIT_SECONDS = 10.0
+
 
 class BookEngine:
     """Process-wide orchestrator for the Book Engine."""
@@ -144,10 +152,47 @@ class BookEngine:
             self.storage.save_progress(progress)
         return progress
 
-    def delete_book(self, book_id: str) -> bool:
+    async def delete_book(self, book_id: str) -> bool:
+        """Stop any in-flight compilation for this book, then delete it.
+
+        ``Task.cancel()`` only *schedules* a ``CancelledError`` for the next
+        await point inside the worker — it does not stop the task
+        synchronously. The old version called it and immediately deleted the
+        book's files: if the worker was mid-write at that exact moment, the
+        delete could race an open file handle, silently leave files behind
+        (``shutil.rmtree(..., ignore_errors=True)``), and report failure —
+        which the frontend then showed as "nothing happens" on click,
+        because a book stuck in "compiling" looked no different from one
+        that deleted cleanly. Now actually waits for the worker to unwind
+        (bounded, so a worker stuck in a non-cancellable await can't hang
+        the delete forever) before touching the files, and retries the
+        filesystem delete a few times in case anything was still
+        transiently locked.
+        """
         runtime = self._runtimes.pop(book_id, None)
         if runtime and runtime.worker and not runtime.worker.done():
             runtime.worker.cancel()
+            # asyncio.wait_for is the wrong primitive here: on timeout it
+            # still awaits the cancelled task to actually finish before
+            # raising TimeoutError, so a step that swallows CancelledError
+            # (a hung network call with no timeout of its own, a tight loop)
+            # would hang wait_for — and this whole delete — forever despite
+            # the "timeout". asyncio.wait with a timeout just checks status
+            # after the deadline and returns either way, leaving a still-
+            # running task in `pending` rather than blocking on it.
+            _done, pending = await asyncio.wait(
+                {runtime.worker}, timeout=_DELETE_WORKER_WAIT_SECONDS
+            )
+            if pending:
+                logger.warning(
+                    "Book %s: compile worker did not stop within %.0fs after "
+                    "cancellation — deleting its files anyway; the orphaned "
+                    "task will keep running detached until it errors out on "
+                    "its own (its book directory is gone, so the next write "
+                    "attempt will fail).",
+                    book_id,
+                    _DELETE_WORKER_WAIT_SECONDS,
+                )
         return self.storage.delete_book(book_id)
 
     def set_page_chat_session(self, *, book_id: str, page_id: str, session_id: str) -> Book | None:

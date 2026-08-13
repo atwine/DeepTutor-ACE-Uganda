@@ -29,9 +29,11 @@ from deeptutor.api.routers.auth import (
 from deeptutor.knowledge.manager import KnowledgeBaseManager
 from deeptutor.services.config.model_catalog import ModelCatalogService
 from deeptutor.services.skill.service import SkillService
+from deeptutor.utils.document_validator import DocumentValidator
 
 from .audit import log_admin_action
 from .course_units import (
+    _COURSE_MATERIAL_FILE_TYPES,
     CourseUnitArchivedError,
     approve_enrollment,
     approve_leave,
@@ -78,6 +80,7 @@ from .paths import get_admin_path_service
 from deeptutor.services.db import session_scope
 from deeptutor.services.db.models import (
     Assignment,
+    CourseMaterial,
     CourseUnit,
     Enrollment,
     Submission,
@@ -736,14 +739,16 @@ async def course_unit_roster_endpoint(
 @router.get("/course-units/{course_unit_id}/requests")
 async def course_unit_requests_endpoint(
     course_unit_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current: TokenPayload = Depends(require_instructor_or_admin),
 ) -> dict[str, Any]:
     """Pending enrollment requests awaiting this course unit's instructor(s)."""
     await _require_course_unit_access(current, course_unit_id)
-    enrollments = [
-        e for e in await list_enrollments_for_course(course_unit_id)
-        if e.get("status", "approved") == "pending"
-    ]
+    enrollments = await list_enrollments_for_course(
+        course_unit_id, status="pending", limit=limit, offset=offset
+    )
+    total = await count_enrollments_for_course(course_unit_id, status="pending")
     # Issue #37: batch user lookup — one file read instead of N.
     user_records = await get_users_by_ids([e["user_id"] for e in enrollments])
     requests = [
@@ -751,7 +756,7 @@ async def course_unit_requests_endpoint(
         for enrollment in enrollments
         if (info := await _enrollment_with_student_info(enrollment, user_records)) is not None
     ]
-    return {"requests": requests}
+    return {"requests": requests, "total": total, "limit": limit, "offset": offset}
 
 
 @router.post("/course-units/{course_unit_id}/requests/{user_id}/approve")
@@ -951,8 +956,18 @@ def _course_kb_raw_dir(kb_name: str) -> Path:
 
 def _is_rag_supported(filename: str) -> bool:
     """Whether the file's extension is supported by the RAG FileTypeRouter
-    (i.e. it will actually be indexed). Files like .ipynb are accepted as
-    uploads but not indexed -- their ingestion_status stays 'pending'."""
+    (i.e. it will actually be indexed).
+
+    Every extension currently accepted by course-material upload
+    (``_COURSE_MATERIAL_FILE_TYPES``, including ``.ipynb`` -- parsed into
+    readable cell text via ``deeptutor.utils.notebook_parser`` -- and
+    ``.pdf``/``.docx``/``.pptx``/``.xlsx``/``.md``/``.txt``) is RAG-supported
+    today, so this always returns True for a successfully-uploaded material.
+    Kept as an explicit guard rather than assuming that stays true forever --
+    if a future upload type isn't RAG-supported, it should still be stored
+    and downloadable with ``ingestion_status`` left at ``'pending'`` instead
+    of erroring, which is what the caller below relies on this for.
+    """
     from deeptutor.services.rag.file_routing import FileTypeRouter
 
     return FileTypeRouter.has_supported_extension(filename)
@@ -966,9 +981,9 @@ async def _run_material_indexing(
     Mirrors the existing KB upload path (``run_upload_processing_task`` in
     ``knowledge.py``) but lighter -- a single file, no task-stream wiring. The
     material's ``ingestion_status`` is updated (pending -> indexing ->
-    ready/failed) so the frontend can poll. Non-RAG-supported files (e.g.
-    .ipynb) skip indexing and stay 'pending' -- they're still stored and
-    downloadable, just not in the RAG index.
+    ready/failed) so the frontend can poll. Any future upload type that
+    isn't RAG-supported (see ``_is_rag_supported``) skips indexing and stays
+    'pending' -- still stored and downloadable, just not in the RAG index.
     """
     try:
         await update_ingestion_status(material_id, "indexing")
@@ -1034,6 +1049,61 @@ async def _run_material_indexing(
         await update_ingestion_status(material_id, "failed")
 
 
+async def _run_material_reindex(kb_name: str, course_unit_id: str) -> None:
+    """Background task: rebuild a course KB's index from its surviving raw
+    files after deleting a material that was already indexed (issue #87).
+
+    ``RAGService.initialize`` is the same "build the index" entry point
+    ``_run_material_indexing`` already uses for a course KB's very first
+    material — for the llamaindex pipeline this is an explicit rebuild
+    operation (``resolve_storage_dir_for_rebuild`` writes to a fresh
+    version dir and only swaps it in on success), so a failed rebuild here
+    leaves the previous, still-correct-but-stale index in place rather than
+    corrupting it.
+
+    If no RAG-supported materials remain, the stale index is left as-is
+    (rebuilding "no documents" isn't a supported operation for every
+    pipeline) — the deleted material's content would still be technically
+    retrievable in that edge case. Logged clearly so it's visible rather
+    than silently wrong; left for a follow-up rather than guessing at each
+    pipeline's empty-KB behavior.
+    """
+    try:
+        # list_materials_for_course's dicts don't carry file_path (it's an
+        # on-disk detail, not part of the API response shape) -- query the
+        # ORM rows directly for it instead.
+        async with session_scope() as session:
+            result = await session.execute(
+                select(CourseMaterial).where(
+                    CourseMaterial.course_unit_id == course_unit_id
+                )
+            )
+            materials = result.scalars().all()
+        raw_dir = _course_kb_raw_dir(kb_name)
+        file_paths = [
+            str(raw_dir / m.file_path)
+            for m in materials
+            if _is_rag_supported(m.filename) and (raw_dir / m.file_path).exists()
+        ]
+        if not file_paths:
+            logger.warning(
+                "Course KB %s has no remaining RAG-supported materials after a "
+                "delete -- the old index was left in place and may still "
+                "surface the deleted material's content.",
+                kb_name,
+            )
+            return
+        from deeptutor.services.rag.service import RAGService
+
+        base_dir = admin_kb_base_dir().resolve()
+        rag_service = RAGService(kb_base_dir=str(base_dir))
+        success = await rag_service.initialize(kb_name=kb_name, file_paths=file_paths)
+        if not success:
+            logger.warning("Reindex after material delete failed for KB %s", kb_name)
+    except Exception as exc:
+        logger.warning("Reindex after material delete failed for KB %s: %s", kb_name, exc)
+
+
 @router.post("/admin/course-units/{course_unit_id}/materials/upload")
 async def upload_course_materials(
     course_unit_id: str,
@@ -1060,12 +1130,23 @@ async def upload_course_materials(
     materials: list[dict[str, Any]] = []
     for upload in files:
         original = upload.filename or "upload"
-        # Sanitize the filename -- strip path components, keep the extension.
-        safe_name = Path(original).name
-        if not safe_name or safe_name.startswith((".", "..")):
-            raise HTTPException(
-                status_code=400, detail=f"Invalid filename: {original}"
+        # Issue #86: this used to only strip path components -- no extension
+        # or MIME allowlist, no control-character/Unicode sanitization, so
+        # any file type (including .html, which would be served back with a
+        # guessed text/html Content-Type) could be uploaded and stored under
+        # a course KB's raw/ directory. validate_upload_safety() is the same
+        # helper the Knowledge Center upload path already uses; scoped to
+        # exactly the extensions course materials actually support (not its
+        # own broader default list, which is missing .ipynb and includes
+        # .html) via _COURSE_MATERIAL_FILE_TYPES.
+        try:
+            safe_name = DocumentValidator.validate_upload_safety(
+                original,
+                None,  # size is checked below, mid-stream, once actually known
+                allowed_extensions=set(_COURSE_MATERIAL_FILE_TYPES.keys()),
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         dest = raw_dir / safe_name
         # Avoid clobbering an existing file -- append a short suffix on collision.
         if dest.exists():
@@ -1094,9 +1175,10 @@ async def upload_course_materials(
             file_path=rel_path,
             size_bytes=written,
         )
-        # Trigger background indexing only for RAG-supported files. Non-RAG
-        # files (e.g. .ipynb) stay 'pending' -- they're stored and downloadable
-        # but not in the RAG index.
+        # Trigger background indexing only for RAG-supported files (today,
+        # that's every accepted upload type -- see _is_rag_supported). A
+        # future non-RAG-supported type would stay 'pending' -- still stored
+        # and downloadable, just not in the RAG index.
         if _is_rag_supported(dest.name):
             background_tasks.add_task(
                 _run_material_indexing,
@@ -1193,23 +1275,41 @@ async def unpublish_course_material(
 async def delete_course_material(
     course_unit_id: str,
     material_id: str,
+    background_tasks: BackgroundTasks,
     current: TokenPayload = Depends(require_instructor_or_admin),
 ) -> dict[str, Any]:
     """Delete a course material -- removes the physical file from the KB's raw/
-    directory and the DB record. Permission: instructor_or_admin (must be an
-    instructor of this unit). Returns 204 No Content."""
+    directory and the DB record, and (issue #87) triggers a background reindex
+    of the KB from its surviving materials if the deleted one was already
+    indexed, so it stops being retrievable via the chat rag tool. Permission:
+    instructor_or_admin (must be an instructor of this unit). Returns 204 No
+    Content."""
     await _require_course_unit_access(current, course_unit_id)
     material = await get_material_orm(course_unit_id, material_id)
     if material is None:
         raise HTTPException(status_code=404, detail="Material not found")
-    # Remove the physical file from the KB's raw/ directory (best-effort).
+    # Whether a reindex is needed comes from the material's own
+    # ingestion_status, not remove_raw_document's was_indexed flag: course
+    # KBs are built via RAGService.initialize() on first upload, which never
+    # populates metadata.json's file_hashes (only the incremental
+    # DocumentAdder path does) -- was_indexed would silently read False for
+    # every course material ever indexed through that first-upload path,
+    # which is the common case. ingestion_status=="ready" is tracked on
+    # every material regardless of which indexing path built it.
+    was_indexed = material.ingestion_status == "ready"
+    # Remove the physical file from the KB's raw/ directory and its indexed-hash
+    # record if one exists (the same helper the personal-KB single-file delete
+    # uses -- a no-op on the hash side for course KBs per the above, but still
+    # the right way to delete the raw file) -- best-effort, same as before.
     kb_name = await get_course_kb_name(course_unit_id)
     if kb_name:
         try:
+            from deeptutor.knowledge.add_documents import remove_raw_document
+
             raw_dir = _course_kb_raw_dir(kb_name)
             file_path = raw_dir / material.file_path
-            if file_path.exists():
-                file_path.unlink()
+            kb_dir = admin_kb_base_dir().resolve() / kb_name
+            remove_raw_document(kb_dir, file_path)
         except Exception as exc:
             logger.warning(
                 "Failed to remove material file %s: %s", material.file_path, exc
@@ -1217,6 +1317,10 @@ async def delete_course_material(
     removed = await delete_material(course_unit_id, material_id)
     if not removed:
         raise HTTPException(status_code=404, detail="Material not found")
+    if kb_name and was_indexed:
+        background_tasks.add_task(
+            _run_material_reindex, kb_name=kb_name, course_unit_id=course_unit_id
+        )
     log_admin_action(
         "course_material_delete",
         summary={"course_unit_id": course_unit_id, "material_id": material_id},
@@ -1593,6 +1697,25 @@ async def _compute_insights(term: str) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/health-check")
+async def admin_health_check(
+    _: TokenPayload = Depends(require_admin),
+) -> dict[str, Any]:
+    """Issue #79: on-demand data-integrity check -- enrollments marked
+    complete without the submissions to back it up, courses with no
+    instructor, assignments that can never be passed. A second line of
+    defense alongside the FK hardening (issue #66) and the #63/#64/#65
+    correctness fixes; catches anything that slipped through before those
+    landed. Same checks as ``scripts/data_integrity_check.py`` (for
+    running on a schedule outside the app), exposed here so an admin can
+    check without shell access.
+    """
+    from .health_check import run_all_checks
+
+    findings = await run_all_checks()
+    return {"findings": findings, "count": len(findings)}
+
+
 @router.get("/admin/insights")
 async def admin_insights(
     term: str = Query("", description="Filter to a single CourseUnit.term; empty = all terms"),
@@ -1854,8 +1977,17 @@ async def admin_reset_submission_attempts(
 
     Admin-only (the admin is the last-resort fixer). Instructors use the
     assignment access grant system for accommodations instead.
+
+    Issue #63: Enrollment.completed_at is additive/idempotent — nothing
+    else in the codebase ever clears it once set. If this assignment is a
+    required one and the student had already completed the course, wiping
+    their submission for it without also clearing completed_at leaves the
+    gradebook/catalog/Insights all reporting them as finished despite now
+    being missing a graded submission for required work.
     """
     from sqlalchemy import delete as sa_delete
+
+    from .assignments import get_assignment
 
     async with session_scope() as session:
         result = await session.execute(
@@ -1871,6 +2003,19 @@ async def admin_reset_submission_attempts(
             status_code=404,
             detail="No submissions found for this student/assignment pair",
         )
+
+    assignment = await get_assignment(assignment_id)
+    if assignment is not None and not assignment.get("is_optional", False):
+        async with session_scope() as session:
+            enroll_result = await session.execute(
+                select(Enrollment).where(
+                    Enrollment.course_unit_id == assignment["course_unit_id"],
+                    Enrollment.user_id == str(user_id),
+                )
+            )
+            enrollment = enroll_result.scalar_one_or_none()
+            if enrollment is not None and enrollment.completed_at is not None:
+                enrollment.completed_at = None
 
     log_admin_action(
         "reset_submission_attempts",

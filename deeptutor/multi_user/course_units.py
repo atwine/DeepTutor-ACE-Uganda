@@ -15,12 +15,14 @@ routers only gain ``await``, no logic changes.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from deeptutor.services.db import session_scope
@@ -41,6 +43,10 @@ logger = logging.getLogger(__name__)
 COURSE_END_GRACE_PERIOD_DAYS = 7
 
 
+_SYNC_KB_GRANT_RETRIES = 3
+_SYNC_KB_GRANT_RETRY_DELAY_SECONDS = 0.5
+
+
 async def _sync_course_kb_grant(user_id: str, kb_name: str | None, *, grant_access: bool) -> None:
     """Issue #57: bridge enrollment to course-material RAG access.
 
@@ -54,32 +60,72 @@ async def _sync_course_kb_grant(user_id: str, kb_name: str | None, *, grant_acce
     grants or revokes course access; a no-op if the course has no KB
     provisioned yet, or the user is an admin (admins already see every
     KB and cannot hold a grants file — see ``save_grant``).
+
+    Issue #62: this runs after the enrollment DB transaction has already
+    committed, so a failure here can't be rolled back — but a *revoke*
+    failing silently fails open (a withdrawn student keeps chat access to
+    the course's materials with nothing in the UI hinting anything is
+    wrong), which is worse than a *grant* failing silently (a newly
+    enrolled student just can't retrieve materials yet). Retries a few
+    times for both directions since the underlying write is a plain file
+    write that can hit a transient disk hiccup; only a revoke that's still
+    failing after retries is escalated by raising, so the caller/endpoint
+    surfaces it instead of the access grant quietly drifting out of sync
+    with the enrollment status forever.
     """
     if not kb_name:
         return
-    try:
-        from .grants import load_grant, save_grant
-        from .identity import get_user_by_id
+    last_exc: Exception | None = None
+    for attempt in range(_SYNC_KB_GRANT_RETRIES):
+        try:
+            from .grants import load_grant, save_grant
+            from .identity import get_user_by_id
 
-        record = await get_user_by_id(user_id)
-        if record is None or str(record[1].get("role") or "user") == "admin":
-            return
-        grant = load_grant(user_id)
-        kb_list = grant.setdefault("knowledge_bases", [])
-        existing = [item for item in kb_list if str(item.get("name") or "") == kb_name]
-        if grant_access:
-            if not existing:
-                kb_list.append({"name": kb_name, "resource_id": f"admin:kb:{kb_name}"})
+            record = await get_user_by_id(user_id)
+            if record is None or str(record[1].get("role") or "user") == "admin":
+                return
+            grant = load_grant(user_id)
+            kb_list = grant.setdefault("knowledge_bases", [])
+            existing = [item for item in kb_list if str(item.get("name") or "") == kb_name]
+            if grant_access:
+                if not existing:
+                    kb_list.append({"name": kb_name, "resource_id": f"admin:kb:{kb_name}"})
+                    await save_grant(user_id, grant)
+            elif existing:
+                grant["knowledge_bases"] = [
+                    item for item in kb_list if str(item.get("name") or "") != kb_name
+                ]
                 await save_grant(user_id, grant)
-        elif existing:
-            grant["knowledge_bases"] = [
-                item for item in kb_list if str(item.get("name") or "") != kb_name
-            ]
-            await save_grant(user_id, grant)
-    except Exception:
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _SYNC_KB_GRANT_RETRIES - 1:
+                await asyncio.sleep(_SYNC_KB_GRANT_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if grant_access:
         logger.warning(
-            "Failed to sync course KB grant for user %s, kb %s", user_id, kb_name, exc_info=True
+            "Failed to grant course KB access for user %s, kb %s after %d attempts",
+            user_id,
+            kb_name,
+            _SYNC_KB_GRANT_RETRIES,
+            exc_info=last_exc,
         )
+        return
+    logger.error(
+        "Failed to revoke course KB access for user %s, kb %s after %d attempts — "
+        "this student may still be able to retrieve this course's materials via chat",
+        user_id,
+        kb_name,
+        _SYNC_KB_GRANT_RETRIES,
+        exc_info=last_exc,
+    )
+    raise RuntimeError(
+        f"Enrollment change saved, but revoking course-material chat access for "
+        f"user {user_id} failed after {_SYNC_KB_GRANT_RETRIES} attempts. Their "
+        f"enrollment status is updated correctly, but they may still be able to "
+        f"retrieve this course's materials via chat — please retry or check "
+        f"manually."
+    ) from last_exc
 
 
 def new_course_unit_id() -> str:
@@ -840,11 +886,19 @@ async def check_and_mark_completion(
         published = [
             a for a in await list_assignments_for_course(course_unit_id) if a["status"] == "published"
         ]
+    # Issue #64: the early-return below is for "no published assignments at
+    # all — nothing to finish", not "every published assignment happens to
+    # be optional." With zero required assignments the completion rule
+    # ("every required published assignment has a graded submission") is
+    # vacuously true, so a course made entirely of optional/bonus work
+    # should still be completable — the loop below already handles that
+    # correctly (falls straight through) once this only guards on
+    # `published` being empty.
+    if not published:
+        return ""
     # Issue #32: optional/bonus assignments don't block completion — only
     # required (non-optional) published assignments must be submitted.
     required = [a for a in published if not a.get("is_optional", False)]
-    if not required:
-        return ""
     for assignment in required:
         if submission_batch is not None:
             submission = submission_batch.get((assignment["id"], str(user_id)))
@@ -890,10 +944,13 @@ async def check_and_mark_completion_batch(
 
     # Issue #32: optional/bonus assignments don't block completion — only
     # required (non-optional) published assignments must be submitted.
+    # Issue #64: no early-return when required_assignments is empty (that
+    # used to unconditionally report every student as incomplete for a
+    # course made entirely of optional/bonus work) — the top-level guard
+    # above already handles "no published assignments at all", and an
+    # empty assignment_ids list makes the all() check below vacuously
+    # True for everyone, which is the correct completion result.
     required_assignments = [a for a in published_assignments if not a.get("is_optional", False)]
-    if not required_assignments:
-        return {uid: "" for uid in user_ids}
-
     assignment_ids = [a["id"] for a in required_assignments]
 
     # Determine which students have submitted all published assignments —
@@ -940,7 +997,7 @@ async def check_and_mark_completion_batch(
 # ---------------------------------------------------------------------------
 
 
-async def delete_user_data(user_id: str) -> None:
+async def delete_user_data(session: AsyncSession, user_id: str) -> None:
     """Explicitly delete a user's Enrollment and Submission rows, as a
     deliberate step of deleting their account.
 
@@ -953,16 +1010,19 @@ async def delete_user_data(user_id: str) -> None:
     be deleted at all; the database will refuse the account deletion
     otherwise. This function is that explicit, deliberate step.
 
-    Called from ``identity.py:delete_user()`` — and MUST run before that
-    function deletes the ``User`` row, not after (see its docstring).
+    Takes the caller's own ``session`` (issue #81) rather than opening its
+    own ``session_scope()``: this sweep and the ``User`` row delete in
+    ``identity.py:delete_user()`` must commit or roll back together — a
+    process crash between two separate transactions used to be able to
+    leave a user's enrollments/submissions gone but the account itself
+    still present.
     """
-    async with session_scope() as session:
-        await session.execute(
-            delete(Enrollment).where(Enrollment.user_id == str(user_id))
-        )
-        await session.execute(
-            delete(Submission).where(Submission.user_id == str(user_id))
-        )
+    await session.execute(
+        delete(Enrollment).where(Enrollment.user_id == str(user_id))
+    )
+    await session.execute(
+        delete(Submission).where(Submission.user_id == str(user_id))
+    )
 
 # ---------------------------------------------------------------------------
 # Issue #3: Course materials (instructor uploads + course-specific RAG)
@@ -1156,3 +1216,36 @@ async def update_ingestion_status(
             return
         material.ingestion_status = status
         await session.flush()
+
+
+async def recover_stuck_indexing_materials() -> int:
+    """Startup recovery for materials orphaned mid-index (issue #88).
+
+    ``_run_material_indexing`` sets ``ingestion_status="indexing"`` around
+    the actual indexing work and always updates it to ``ready``/``failed``
+    on the way out -- except that in-memory ``BackgroundTasks`` coroutine
+    cannot survive a process restart, OOM kill, or ungraceful shutdown. Any
+    material still reading ``"indexing"`` when this runs at the *next*
+    startup can only be one that was killed mid-flight during a previous
+    run (a live process never leaves that state set on its own without
+    finishing the try/except that clears it) -- no time threshold is
+    needed to tell "genuinely still indexing" apart from "stuck", since a
+    genuinely-still-indexing task cannot exist yet at the moment this
+    function runs, at the very start of a fresh process.
+
+    Resets to ``"failed"`` rather than back to ``"pending"``: silently
+    re-queuing indexing on every restart could retry the same
+    crash-inducing document forever. ``"failed"`` at least surfaces in the
+    instructor UI and lets them explicitly retry.
+
+    Returns the number of materials recovered.
+    """
+    async with session_scope() as session:
+        result = await session.execute(
+            select(CourseMaterial).where(CourseMaterial.ingestion_status == "indexing")
+        )
+        stuck = result.scalars().all()
+        for material in stuck:
+            material.ingestion_status = "failed"
+        await session.flush()
+    return len(stuck)

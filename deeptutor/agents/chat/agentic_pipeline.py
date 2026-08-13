@@ -598,11 +598,36 @@ class AgenticChatPipeline:
 
             level = await get_sandbox_service().isolation_level()
             if level is IsolationLevel.SYSTEM:
-                # Admin can switch exec off per user (grant v2). ``None``
-                # follows the policy: SYSTEM isolation serves everyone.
                 from deeptutor.multi_user.tool_access import exec_override
 
-                return exec_override() is not False
+                # Admin can switch exec on/off per user (grant v2) -- an
+                # explicit override always wins, in either direction.
+                override = exec_override()
+                if override is not None:
+                    return override
+                # Issue #7: with no override set, exec used to default to
+                # "on for everyone". SYSTEM isolation's sandbox-runner
+                # sidecar shares one filesystem view across every account's
+                # exec calls (the per-user volume mount is a whole user
+                # root, not scoped to the requesting account -- see
+                # docker-compose.yml's own scope note on that service) --
+                # so a non-admin's exec could read another student's chat
+                # history, knowledge bases, or settings. Until real
+                # per-student isolation is built, default OFF for
+                # non-admins; an admin can still opt a specific student
+                # back in via the same exec_override grant. Partner turns
+                # run under the admin owner's authority regardless of the
+                # synthetic "user" role, so they're unaffected.
+                if is_partner:
+                    return True
+                try:
+                    from deeptutor.multi_user.context import get_current_user
+
+                    return bool(get_current_user().is_admin)
+                except Exception:
+                    # Single-user local runtime: no other account's data
+                    # exists for a non-admin's exec to cross into.
+                    return True
             if level is IsolationLevel.APPLICATION:
                 if is_partner:
                     return True

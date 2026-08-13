@@ -168,6 +168,40 @@ feature/*   →   development   →   staging   →   main
 Never push directly to `main` — merge into `staging` first, then open a
 PR from `staging` into `main`.
 
+## Pre-Commit Review Gate
+
+**Every commit must be reviewed before it's made — no exceptions, including
+"trivial" changes.** This was formalized after a session where an ~97-commit,
+207-file `staging` branch had accumulated with no consistent review process,
+making a proper review nearly impossible without splitting it across many
+separate passes.
+
+- **Review the diff you are about to commit, not a batch of unrelated
+  changes.** Keep commits small and scoped to one change; a large commit is
+  a sign work should have been split, not a review to defer. Batching many
+  fixes into one commit specifically to reduce how often you have to review
+  is against the spirit of this rule.
+- **Depth is proportional to size and risk**, not a fixed ceremony:
+  - A one-line config/copy fix: read the diff yourself, confirm it does what
+    it says, move on.
+  - Anything touching business logic, auth, money/grades, or data
+    deletion/migration: re-read the full diff line by line, check every
+    caller of anything you changed (not just the lines the diff shows), and
+    verify live against the running app — not just "the code looks right."
+  - When in doubt, use the `code-review` skill rather than a purely manual
+    read.
+- **"Tests pass" is not sufficient on its own** for anything touching
+  multi-user/course logic — this codebase's real bugs have consistently
+  been integration-level, caught by live testing against the running
+  Docker stack, not unit tests. If Docker is up, use it.
+- **Log what you verified, not just what you changed.** Follow
+  `devin-handoff/DEVIN_LOG.md`'s own entry format (Item / Status / What
+  changed / **Verified** / New findings / Left for later) — the `Verified`
+  line should say *how* you confirmed the change actually works, not just
+  restate the diff.
+- This applies to every agent working in this repo (Claude, Devin, or
+  anyone else) and to every branch, not just `main`-bound work.
+
 ## Documentation Conventions
 
 ### Python (Google-style docstrings)

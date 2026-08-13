@@ -36,7 +36,12 @@ from .identity import get_user_by_id, get_users_by_ids
 
 
 def assignment_max_points(assignment: dict[str, Any]) -> float:
-    return sum(float(q.get("points") or 1.0) for q in assignment.get("questions", []))
+    # Issue #65: same `0 or 1.0` fix as assignments.py/grading.py -- an
+    # explicit `points: 0` question was silently counted as worth 1 here too.
+    return sum(
+        float(q["points"]) if q.get("points") is not None else 1.0
+        for q in assignment.get("questions", [])
+    )
 
 
 async def build_gradebook(course_unit_id: str) -> dict[str, Any]:

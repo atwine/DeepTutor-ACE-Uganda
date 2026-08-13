@@ -39,6 +39,17 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "chat_attachment_max_total_mb": 25,
     "chat_attachment_max_chars_per_doc": 200_000,
     "chat_attachment_max_chars_total": 150_000,
+    # Wall-clock ceiling on a single tool call inside the agentic loop
+    # (dispatch_tool_calls / execute_tool_call). A tool with no timeout of
+    # its own (a hung network call, a sandboxed exec that never exits) would
+    # otherwise stall the whole turn indefinitely — see issue #83.
+    "tool_execution_timeout_seconds": 120,
+    # Ceiling on a single AI Judge grading call for a free-text assignment
+    # question (deeptutor/multi_user/grading.py). Deliberately shorter than
+    # the underlying HTTP client's 120s timeout — a student waiting on
+    # submit shouldn't be stuck behind that, and each unanswered free-text
+    # question is one serial LLM call. See issue #89.
+    "grading_timeout_seconds": 30,
 }
 
 # Clamp bounds for the chat attachment knobs. The MB ceilings are deliberately
@@ -47,6 +58,8 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 CHAT_ATTACHMENT_MAX_FILE_MB_RANGE = (1, 1024)
 CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE = (1, 2048)
 CHAT_ATTACHMENT_CHARS_RANGE = (10_000, 5_000_000)
+TOOL_EXECUTION_TIMEOUT_SECONDS_RANGE = (5, 600)
+GRADING_TIMEOUT_SECONDS_RANGE = (5, 120)
 
 DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -1066,6 +1079,16 @@ class RuntimeSettingsService:
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_total"],
                 *CHAT_ATTACHMENT_CHARS_RANGE,
             ),
+            "tool_execution_timeout_seconds": _coerce_clamped_int(
+                settings.get("tool_execution_timeout_seconds"),
+                DEFAULT_SYSTEM_SETTINGS["tool_execution_timeout_seconds"],
+                *TOOL_EXECUTION_TIMEOUT_SECONDS_RANGE,
+            ),
+            "grading_timeout_seconds": _coerce_clamped_int(
+                settings.get("grading_timeout_seconds"),
+                DEFAULT_SYSTEM_SETTINGS["grading_timeout_seconds"],
+                *GRADING_TIMEOUT_SECONDS_RANGE,
+            ),
         }
 
     def _normalize_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1176,6 +1199,16 @@ def compute_ws_max_size(max_total_bytes: int) -> int:
 def get_ws_max_size() -> int:
     """Frame ceiling for the current settings — wire into every uvicorn launch."""
     return compute_ws_max_size(get_chat_attachment_limits().max_total_bytes)
+
+
+def get_tool_execution_timeout_seconds() -> float:
+    """Per-call timeout for the agentic loop's tool dispatch (system.json + env)."""
+    return float(load_system_settings()["tool_execution_timeout_seconds"])
+
+
+def get_grading_timeout_seconds() -> float:
+    """Per-question timeout for AI Judge free-text grading (system.json + env)."""
+    return float(load_system_settings()["grading_timeout_seconds"])
 
 
 def load_auth_settings() -> dict[str, Any]:

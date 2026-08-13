@@ -10,11 +10,14 @@ conversational stream.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from deeptutor.api.routers.quiz_judge import _JUDGE_SYSTEM_PROMPTS, _build_judge_user_prompt
+from deeptutor.services.config.runtime_settings import get_grading_timeout_seconds
 from deeptutor.services.llm import complete as llm_complete
+from deeptutor.services.llm.exceptions import LLMError
 
 from .assignments import QUESTION_TYPES_AUTO_GRADABLE
 
@@ -66,8 +69,19 @@ async def _grade_free_text(
     if not user_answer.strip():
         return "", 0.0
     try:
-        verdict_text = await llm_complete(user_prompt, system_prompt=system_prompt)
-    except Exception as exc:
+        verdict_text = await asyncio.wait_for(
+            llm_complete(user_prompt, system_prompt=system_prompt),
+            timeout=get_grading_timeout_seconds(),
+        )
+    except TimeoutError:
+        # Deliberately shorter and separately messaged than the underlying
+        # HTTP client's own 120s timeout (issue #89) — a student waiting on
+        # submit shouldn't be stuck behind that, and this is a distinct,
+        # more actionable signal for the instructor than a generic provider
+        # failure.
+        logger.warning("AI Judge grading call timed out")
+        return "AI grading timed out — an instructor will review this.", 0.0
+    except LLMError as exc:
         logger.warning("AI Judge grading call failed: %s", exc)
         return "AI grading is temporarily unavailable — an instructor will need to grade this by hand.", 0.0
     return verdict_text, _parse_verdict_fraction(verdict_text)
@@ -96,7 +110,9 @@ async def grade_submission(
 
     for question in assignment.get("questions", []):
         qid = question.get("question_id", "")
-        points = float(question.get("points") or 1.0)
+        # Issue #65: same `0 or 1.0` fix as assignments.py's _normalize_question
+        # -- an explicit `points: 0` question was silently regraded worth 1.
+        points = float(question["points"]) if question.get("points") is not None else 1.0
         user_answer = answers_by_question.get(qid, "")
         question_type = question.get("question_type", "")
         total_max += points

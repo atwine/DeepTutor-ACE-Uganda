@@ -183,6 +183,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"v1 memory migration failed: {e}")
 
+    # Recover course materials orphaned mid-index by a previous crash/restart
+    # (issue #88) -- see recover_stuck_indexing_materials()'s docstring for
+    # why no time threshold is needed.
+    try:
+        from deeptutor.multi_user.course_units import recover_stuck_indexing_materials
+
+        recovered = await recover_stuck_indexing_materials()
+        if recovered:
+            logger.info(
+                "Recovered %d course material(s) stuck in 'indexing' from a "
+                "previous run",
+                recovered,
+            )
+    except Exception as e:
+        logger.warning(f"Stuck course-material indexing recovery failed: {e}")
+
     yield
 
     # Execute on shutdown

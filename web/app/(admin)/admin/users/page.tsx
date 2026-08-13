@@ -225,6 +225,22 @@ export default function AdminUsersPage() {
   // Issue #42: Client-side pagination over the filtered user list.
   const pagedUsers = filteredUsers.slice(pageOffset, pageOffset + USERS_PAGE_LIMIT);
 
+  // Issue #76: if the list shrinks (e.g. deleting the last user on the
+  // current page) and pageOffset now points past the end, the slice above
+  // renders empty while the pager still claims a later page -- step back
+  // to the last page that actually has rows.
+  useEffect(() => {
+    if (filteredUsers.length === 0) {
+      if (pageOffset !== 0) setPageOffset(0);
+      return;
+    }
+    if (pageOffset >= filteredUsers.length) {
+      const lastPageOffset =
+        Math.floor((filteredUsers.length - 1) / USERS_PAGE_LIMIT) * USERS_PAGE_LIMIT;
+      setPageOffset(lastPageOffset);
+    }
+  }, [filteredUsers.length, pageOffset]);
+
   return (
     <div className="h-screen overflow-y-auto bg-[var(--background)] px-4 py-10 [scrollbar-gutter:stable]">
       <div className="mx-auto max-w-3xl">
