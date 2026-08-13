@@ -244,10 +244,22 @@ class BookStorage:
     # ── Delete ───────────────────────────────────────────────────────────
 
     def delete_book(self, book_id: str) -> bool:
+        """Delete a book's directory. Retries a few times: ``ignore_errors``
+        silently leaves behind any file that's still open (e.g. a
+        background writer that hadn't quite unwound after cancellation),
+        which used to report failure with no way to tell the caller what
+        went wrong or to just try again a moment later."""
+        import time as _time
+
         root = self.book_root(book_id)
         if not root.exists():
             return False
-        shutil.rmtree(root, ignore_errors=True)
+        for attempt in range(3):
+            shutil.rmtree(root, ignore_errors=True)
+            if not root.exists():
+                return True
+            if attempt < 2:
+                _time.sleep(0.3 * (attempt + 1))
         return not root.exists()
 
 

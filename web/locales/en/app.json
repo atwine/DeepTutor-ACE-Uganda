@@ -1532,6 +1532,7 @@
   "Knowledge bases used": "Knowledge bases used",
   "No knowledge bases selected. The book will rely on general knowledge.": "No knowledge bases selected. The book will rely on general knowledge.",
   "Delete this book? This cannot be undone.": "Delete this book? This cannot be undone.",
+  "Failed to delete book": "Failed to delete book",
   "Rebuild this book using the current chapter structure? Existing generated pages will be replaced.": "Rebuild this book using the current chapter structure? Existing generated pages will be replaced.",
   "Delete this {{type}} block?": "Delete this {{type}} block?",
   "Loading spine…": "Loading spine…",

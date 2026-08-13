@@ -225,7 +225,16 @@ function BookPageInner() {
 
   const handleDeleteBook = async (id: string) => {
     if (!confirm(t("Delete this book? This cannot be undone."))) return;
-    await bookApi.delete(id);
+    // This used to have no try/catch: a delete that failed (e.g. a stuck
+    // "compiling" book whose background worker briefly held a file open)
+    // produced an unhandled promise rejection with zero UI feedback -- the
+    // book just stayed in the list with no indication anything went wrong.
+    try {
+      await bookApi.delete(id);
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : t("Failed to delete book"));
+      return;
+    }
     if (selectedBookId === id) {
       setSelectedBookId(null);
       setDetail(null);

@@ -270,12 +270,21 @@ async def delete_book(book_id: str) -> dict[str, Any]:
         A dict confirming deletion with the book_id.
 
     Raises:
-        HTTPException: 404 if the book is not found.
+        HTTPException: 404 if the book doesn't exist; 409 if it exists but
+            couldn't be deleted (e.g. a file was still locked after the
+            in-flight compile was cancelled and retried) — distinct from
+            404 so the frontend doesn't report a book as "not found" when
+            it's actually still sitting there.
     """
     engine = get_book_engine()
-    ok = engine.delete_book(book_id)
-    if not ok:
+    if engine.load_book(book_id) is None:
         raise HTTPException(status_code=404, detail="Book not found")
+    ok = await engine.delete_book(book_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail="Could not delete this book — its files may still be in use. Please try again.",
+        )
     return {"deleted": True, "book_id": book_id}
 
 
