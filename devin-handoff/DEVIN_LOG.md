@@ -5872,3 +5872,103 @@ per the original issue's own framing). Rest of the backlog from the
 entry above is unchanged.
 
 ---
+
+## 2026-08-13 — Claude — Promoted development → staging; shipped #78 (backups); readiness check for a first main promotion
+
+**Item**: not in TODO.md. Repo owner asked to evaluate whether `development`
+was ready to promote to `staging` (per this repo's `feature → development →
+staging → main` flow in `AGENTS.md`), with an eye toward a first PR from
+`staging` into `main` — described wanting to stop chasing every issue to zero
+and get the app in front of real users for feedback instead. Explicitly asked
+"is there anything really critical that would stop us."
+**Status**: `development` → `staging` promoted and pushed. One real gap
+(backups, issue #78) found during the readiness check, explained to the
+repo owner (who was reasonably confused about what "back up now" even meant
+for a database that only holds synthetic test data), then built and
+verified. `staging` not yet re-synced with the #78 commit as of this entry
+— see "Left for later" below.
+
+**Readiness check before promoting**:
+- Ran the full test suite (`pytest`, 3437 collected) and specifically
+  diff-compared `development` against the pre-promotion `staging` baseline
+  using a throwaway `git worktree` at `/tmp/staging-check`, rather than
+  trusting a single run's pass/fail count at face value.
+- First pass showed development with 31 failed vs. staging's 25 — 6 tests
+  looked like new regressions (`test_cors_settings.py`,
+  `test_question_router.py`, `test_space_cli_apps.py`, all failing on
+  unexpected 401s). Chased it down instead of accepting the number:
+  root cause was `C:\dev\DeepTutor\data\user\settings\auth.json` on this
+  local machine reading `"enabled": true` — real local runtime state
+  (gitignored, never part of the diff) left over from this session's own
+  live-testing via the Docker bind mount, bleeding into local pytest runs
+  that assume auth defaults to disabled. Proved it by temporarily moving
+  the file aside and rerunning — all 20 passed. **Not a code regression.**
+  The remaining 25 failures are identical on both branches (missing
+  optional deps — `slack_sdk`, `telegram`, `matrix` — plus a few
+  Windows-path/fixture issues), pre-existing technical debt unrelated to
+  this session.
+- The full 3437-test run (finished in the background, ~28 minutes) came
+  back at 93 failed — every one in modules this session never touched
+  (RAG pipeline internals, MCP OAuth, the sandbox-runner test harness,
+  memory snapshot adapters, skill hub, json parser). Consistent with the
+  same class of local-environment gaps (missing optional packages, fixtures
+  that expect a live sidecar container not present outside Docker), not
+  reviewed file-by-file given the volume, but the *files this session
+  actually changed* were already covered by the targeted, verified-clean
+  comparison above.
+- Git state: `development` was 31 commits ahead of `staging`, cleanly — the
+  8 commits that showed as "staging-only" in a naive `git log` diff were
+  all prior "Promote development to staging: ..." merge commits (confirmed
+  each is a 2-parent merge whose second parent already exists in
+  `development`'s own history), not independent work sitting on `staging`
+  that a merge would need to reconcile. Normal `git merge`, no conflicts.
+
+**Promoted**: `git merge development` into `staging`, pushed
+(`94dfc73a..f8ede82e`), commit message follows this repo's existing
+"Promote development to staging: ..." convention, summarizing every fix
+from this session (see the several entries above for the individual
+verification detail on each).
+
+**#78 (backups) — the one gap actually worth stopping for**, explained to
+the repo owner in plain terms first (they were understandably unsure
+whether "back up now" meant backing up today's synthetic test data, which
+doesn't matter, vs. having the *mechanism* ready before real data exists,
+which is the actual point — a smoke detector installed before the house
+is occupied, not after a fire). Built:
+- `scripts/backup.py` — `pg_dump` inside the running Postgres container
+  (the database lives in a Docker-managed named volume, not a plain
+  folder, so a file-level copy isn't an option) plus a compressed archive
+  of `data/`. Writes a manifest (timestamp, git commit, sizes). Prunes
+  backups older than `BACKUP_RETENTION_DAYS` (default 14). Exits 1 on any
+  failure, including a suspiciously small dump (treated as a failed
+  backup, not filed away as a usable one) — safe for a scheduler to alert
+  on.
+- `scripts/restore_backup.py` — restores into a **throwaway verification
+  database** by default (`deeptutor_restore_verify`), never touching live
+  data; restoring over the live database requires an explicit `--live`
+  flag *and* typing the database name to confirm, the same friction this
+  codebase already uses for other destructive operations.
+- `backups/` added to `.gitignore` — contains real user data, must never
+  be committed.
+**Verified live, the actual point of building this at all**: ran
+`backup.py` against the real running stack, then ran `restore_backup.py`
+against that exact backup into the verification database, then compared
+row counts (`users`/`course_units`/`enrollments`/`assignments`/
+`submissions`) between the live database and the restored one — exact
+match on every table. This is a backup that has been proven restorable,
+not just assumed to work because a file got written. Commit `70364656`.
+
+**New findings**: the local `auth.json` test-pollution issue above (not a
+product bug — a local dev-environment gotcha, worth remembering if test
+runs against this checkout ever look newly broken again).
+**Left for later / handing back**: `staging` has not yet been re-synced
+with commit `70364656` (the backup system) — it landed on `development`
+after the promotion above. Trivial fast-forward-style merge, just not
+done as of this entry. Actually *scheduling* `backup.py` to run
+automatically (cron / Task Scheduler / systemd timer) is explicitly
+deferred until a hosting decision is made — the mechanism itself doesn't
+depend on that decision, only where it eventually runs. The repo owner
+had not yet decided, as of this entry, whether to proceed straight to a
+`staging` → `main` PR now that backups exist, or wants another pass first.
+
+---
