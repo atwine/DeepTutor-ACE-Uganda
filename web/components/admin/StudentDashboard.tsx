@@ -224,6 +224,41 @@ export function StudentDashboard({
   }
 
   // --- Actions ---
+  // Issue #68: Promise.all rejects on the first failure, so a bulk action
+  // over N students reported one generic "Action failed" with no way to
+  // tell how many actually succeeded. Promise.allSettled runs every call
+  // to completion and this reports a per-student success/failure count
+  // instead, and throws only if every single one failed (so the confirm
+  // dialog doesn't close on a total failure, but does on a partial one --
+  // the successes already happened server-side either way).
+  async function runBulkAction(
+    ids: string[],
+    action: (student: StudentOverviewRow) => Promise<unknown>,
+    pastTenseVerb: string,
+  ): Promise<void> {
+    const targets = ids
+      .map((id) => students.find((r) => r.id === id))
+      .filter((s): s is StudentOverviewRow => Boolean(s));
+    const results = await Promise.allSettled(targets.map((s) => action(s)));
+    const failed = results
+      .map((r, i) => (r.status === "rejected" ? targets[i] : null))
+      .filter((s): s is StudentOverviewRow => s !== null);
+    const succeededCount = targets.length - failed.length;
+    if (failed.length === 0) return;
+    if (succeededCount === 0) {
+      throw new Error(t("Action failed for all {{count}} selected user(s)", { count: failed.length }));
+    }
+    setActionError(
+      t("{{succeeded}} of {{total}} {{verb}} — {{failedCount}} failed: {{names}}", {
+        succeeded: succeededCount,
+        total: targets.length,
+        verb: pastTenseVerb,
+        failedCount: failed.length,
+        names: failed.map((s) => s.username).join(", "),
+      }),
+    );
+  }
+
   async function handleConfirm() {
     if (!confirm || actionBusy) return;
     setActionBusy(true);
@@ -246,21 +281,19 @@ export function StudentDashboard({
         setConfirm(null);
         onRefresh();
       } else if (confirm.kind === "bulk_disable") {
-        await Promise.all(
-          Array.from(selectedIds).map((id) => {
-            const s = students.find((r) => r.id === id);
-            return s ? setUserDisabled(s.username, true) : Promise.resolve();
-          }),
+        await runBulkAction(
+          Array.from(selectedIds),
+          (s) => setUserDisabled(s.username, true),
+          t("disabled"),
         );
         setConfirm(null);
         clearSelection();
         onRefresh();
       } else if (confirm.kind === "bulk_delete") {
-        await Promise.all(
-          Array.from(selectedIds).map((id) => {
-            const s = students.find((r) => r.id === id);
-            return s ? deleteUser(s.username) : Promise.resolve();
-          }),
+        await runBulkAction(
+          Array.from(selectedIds),
+          (s) => deleteUser(s.username),
+          t("deleted"),
         );
         setConfirm(null);
         clearSelection();
