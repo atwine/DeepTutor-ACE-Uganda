@@ -886,11 +886,19 @@ async def check_and_mark_completion(
         published = [
             a for a in await list_assignments_for_course(course_unit_id) if a["status"] == "published"
         ]
+    # Issue #64: the early-return below is for "no published assignments at
+    # all — nothing to finish", not "every published assignment happens to
+    # be optional." With zero required assignments the completion rule
+    # ("every required published assignment has a graded submission") is
+    # vacuously true, so a course made entirely of optional/bonus work
+    # should still be completable — the loop below already handles that
+    # correctly (falls straight through) once this only guards on
+    # `published` being empty.
+    if not published:
+        return ""
     # Issue #32: optional/bonus assignments don't block completion — only
     # required (non-optional) published assignments must be submitted.
     required = [a for a in published if not a.get("is_optional", False)]
-    if not required:
-        return ""
     for assignment in required:
         if submission_batch is not None:
             submission = submission_batch.get((assignment["id"], str(user_id)))
@@ -936,10 +944,13 @@ async def check_and_mark_completion_batch(
 
     # Issue #32: optional/bonus assignments don't block completion — only
     # required (non-optional) published assignments must be submitted.
+    # Issue #64: no early-return when required_assignments is empty (that
+    # used to unconditionally report every student as incomplete for a
+    # course made entirely of optional/bonus work) — the top-level guard
+    # above already handles "no published assignments at all", and an
+    # empty assignment_ids list makes the all() check below vacuously
+    # True for everyone, which is the correct completion result.
     required_assignments = [a for a in published_assignments if not a.get("is_optional", False)]
-    if not required_assignments:
-        return {uid: "" for uid in user_ids}
-
     assignment_ids = [a["id"] for a in required_assignments]
 
     # Determine which students have submitted all published assignments —
