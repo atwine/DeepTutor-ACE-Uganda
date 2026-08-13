@@ -5413,3 +5413,100 @@ explicit instructions: whether to reopen/re-scope #61, #35, #42, #58 the way
 me.
 
 ---
+
+## 2026-08-13 — Claude — Fixed #81, #87, #88, #89, all live-verified; one self-caught bug along the way
+
+**Item**: not in TODO.md — continuing the repo owner's punch list from the
+entry above ("start on #81, #87, #88, #89 next"), same discipline: pre-commit
+review gate, live Docker verification, one commit per fix.
+**Status**: all four fixed, live-verified, committed. This closes out every
+bug from the #80-#89 sweep that was worth fixing as filed (#80 and #86 were
+already downgraded/refuted in the prior entry; #85 was closed as invalid).
+
+**#81 — `identity.delete_user()` not atomic.**
+`deeptutor/multi_user/course_units.py`'s `delete_user_data()` now takes the
+caller's `session: AsyncSession` instead of opening its own
+`session_scope()`; `identity.py`'s `delete_user()` runs the lookup, the
+Enrollment/Submission sweep, and the `User` row delete inside one
+transaction. Commit `7298cc2f`.
+
+**#87 — no RAG index cleanup on course-material delete.**
+`delete_course_material` now reuses `remove_raw_document()` (the same
+helper the personal-KB single-file delete already uses) for the raw file,
+and schedules a background `_run_material_reindex()` task — rebuilds the
+KB's index from the surviving materials' raw files via
+`RAGService.initialize()`, the same call `_run_material_indexing` already
+uses for a KB's first material — whenever the deleted material's own
+`ingestion_status` was `"ready"`. Commit `29ef0128`.
+**Self-caught bug worth flagging**: the first implementation used
+`remove_raw_document()`'s returned `was_indexed` flag (checking
+`metadata.json`'s `file_hashes`) as the reindex trigger, mirroring the
+personal-KB pattern. Live testing showed this never fired — course KBs are
+built via `RAGService.initialize()` directly on first upload, which never
+writes `file_hashes` (only the incremental `DocumentAdder.add_documents`
+path does). `was_indexed` would have silently read `False` for every course
+material ever indexed through that common first-upload path, making the
+whole fix dead code. Caught only because the live-verification step actually
+checked the container logs for a reindex firing and found none, rather than
+trusting a 204 response as proof the fix worked. Switched the trigger to the
+material's own `ingestion_status == "ready"`, which is tracked regardless of
+which indexing path built the KB. A second, unrelated bug from the same
+first pass (`list_materials_for_course()`'s response dicts don't carry
+`file_path` — it's not part of the API shape — causing a `KeyError` inside
+the background task) was caught the same way, from a `"Reindex ... failed:
+'file_path'"` warning in the container logs after the was_indexed fix.
+Fixed by querying the `CourseMaterial` ORM rows directly instead.
+
+**#88 — stuck `"indexing"` status, no recovery.**
+Added `recover_stuck_indexing_materials()` to `course_units.py`, wired into
+the FastAPI `lifespan` startup in `deeptutor/api/main.py`. No `updated_at`
+column or time-threshold logic needed (the issue's own suggested fix
+assumed one): a material can only be reading `"indexing"` at the exact
+moment a fresh process starts if it was orphaned by a previous run — a
+live process's own in-flight indexing task cannot have reached that state
+yet when startup code runs. Resets to `"failed"` (not back to `"pending"`)
+so a crash-inducing document doesn't silently retry forever, and so it's
+visible in the instructor UI. Commit `1fe339b0`.
+
+**#89 — grading has no deadline of its own, swallows unrelated bugs.**
+`_grade_free_text` now wraps `llm_complete()` in `asyncio.wait_for()` using
+a new `grading_timeout_seconds` system setting (default 30s, clamped
+5-120s — same pattern as #83's `tool_execution_timeout_seconds`).
+`TimeoutError` gets its own message; `LLMError` (the provider-failure
+family) keeps the existing generic message; the bare `except Exception` is
+gone, so an actual bug (e.g. a `TypeError` in prompt construction) now
+propagates instead of silently scoring 0. Note: the issue's "blocks the
+event loop" framing was inaccurate — `await llm_complete(...)` is a real
+async await, not a blocking call — the genuine problems were the missing
+assignment-appropriate deadline and the exception swallowing, both fixed
+here; the issue's own "longer-term" suggestion (decouple grading from the
+HTTP response entirely) was explicitly out of scope. Commit `06b03b06`.
+
+**Verified**: Docker image rebuilt from `docker-compose.yml` (as established
+in the prior entry) and the container recreated after each round of fixes.
+- **#81**: created a throwaway user, enrolled and submitted an assignment as
+  them (real `Enrollment` + `Submission` rows), deleted the account via
+  `DELETE /api/v1/auth/users/{username}`, confirmed via `psql` that
+  `users`/`enrollments`/`submissions` rows were all gone.
+- **#88**: flipped a real material's `ingestion_status` to `"indexing"`
+  directly in Postgres, restarted the `deeptutor` container, confirmed via
+  `psql` it came back as `"failed"`.
+- **#87**: uploaded two materials to a course KB, waited for both to reach
+  `ingestion_status="ready"`, deleted one via the DELETE endpoint, then
+  called `RAGService.search()` directly inside the container — the deleted
+  material's content no longer matched, the surviving material's content
+  still did, and the KB itself was intact.
+- **#89**: monkeypatched `llm_complete` inside the running container to (1)
+  sleep 10s against a 2s timeout override — returned "timed out" in ~2s, (2)
+  raise `LLMAPIError` — returned the existing provider-failure message, (3)
+  raise a plain `TypeError` — propagated instead of being swallowed as a
+  fake 0.
+**New findings**: the two bugs in the first #87 implementation, described
+above — both caught by this session's own live-verification discipline
+before they were committed, not found later.
+**Left for later / handing back**: nothing new from the #80-#89 sweep
+remains unaddressed as filed. Still open from prior entries: whether to
+reopen/re-scope #61, #35, #42, #58 the way #60 was, and the frontend
+structural-review gap noted in Devin's coverage self-audit above.
+
+---
